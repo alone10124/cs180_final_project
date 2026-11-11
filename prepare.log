@@ -1,0 +1,25 @@
+train 1993, test 272, nearest-train angle median 4.4 max 19.5 deg
+1/2265  1.17 frames/s
+101/2265  1.37 frames/s
+201/2265  1.47 frames/s
+301/2265  1.51 frames/s
+401/2265  1.40 frames/s
+501/2265  1.36 frames/s
+601/2265  1.41 frames/s
+701/2265  1.43 frames/s
+801/2265  1.48 frames/s
+901/2265  1.55 frames/s
+1001/2265  1.58 frames/s
+1101/2265  1.60 frames/s
+1201/2265  1.64 frames/s
+1301/2265  1.66 frames/s
+1401/2265  1.67 frames/s
+1501/2265  1.68 frames/s
+1601/2265  1.68 frames/s
+1701/2265  1.70 frames/s
+1801/2265  1.72 frames/s
+1901/2265  1.72 frames/s
+2001/2265  1.72 frames/s
+2101/2265  1.73 frames/s
+2201/2265  1.73 frames/s
+done
