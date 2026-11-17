@@ -87,11 +87,12 @@ class Discriminator(nn.Module):
 class SRMModel(nn.Module):
     """Refined diffuse D' plus specular S from M basis SRMs (Eqs. 4 and 7)."""
 
-    def __init__(self, materials=2):
+    def __init__(self, materials=2, refine=True):
         super().__init__()
         self.srm = nn.Parameter(0.05 * torch.rand(materials, 3, SRM_H, SRM_W))
         self.material = MaterialNet(materials)
-        self.refine = EncoderDecoder(3)
+        self.refine = EncoderDecoder(3) if refine else None
+        self.cans = "all"
 
     def lookup(self, refl):
         """Sample every SRM along reflection directions; returns B, M, 3, H, W."""
@@ -113,10 +114,12 @@ class SRMModel(nn.Module):
 
     def forward(self, batch, diffuse_linear, diffuse_display):
         weights = self.material(diffuse_display)
-        residual = self.refine(diffuse_display)
+        residual = self.refine(diffuse_display) if self.refine is not None else 0
         diffuse = (diffuse_linear + residual).clamp(min=0) * batch["mask"]
         specular = (weights[:, :, None] * self.lookup(batch["refl"])).sum(dim=1)
         specular = specular * batch["vis"] * batch["mask"]
+        if "spec_mask" in batch:
+            specular = specular * batch["spec_mask"]
         return diffuse, specular, weights
 
     def clamp_srm(self):

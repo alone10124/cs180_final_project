@@ -12,12 +12,11 @@ import cv2
 import lpips
 import numpy as np
 import torch
-from torch.amp import autocast
 
-from common import CACHE, CAN_Z_MIN, GAMMA, RESULTS, RUNS
-from data import Scene, augment, to_display
+from common import CACHE, CAN_Z_MIN, GAMMA, RESULTS, RUNS, H, W
+from data import Scene, augment, pick_device, to_display
 from models import EncoderDecoder
-from train import load_srm, physical_inputs
+from train import amp, load_srm, physical_inputs
 
 ANGLE_BINS = [0, 5, 10, 15, 20]
 
@@ -51,10 +50,10 @@ def main():
     args = ap.parse_args()
 
     RESULTS.mkdir(exist_ok=True)
-    device = torch.device("cuda")
+    device = pick_device()
     scene = Scene(device)
     srm = load_srm(device, args.materials, args.srm_run)
-    save_srm(srm, args.materials)
+    save_srm(srm, len(srm.srm))
 
     generator = EncoderDecoder(13).to(device)
     state = torch.load(RUNS / args.renderer_run / "last.pt", map_location=device)
@@ -69,10 +68,10 @@ def main():
     methods = ["diffuse", "diffuse+specular", "neural_renderer"]
     per_frame = {m: {"l1": [], "lpips": []} for m in methods}
 
-    writer = cv2.VideoWriter(str(RESULTS / "test_views.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (1920, 480))
+    writer = cv2.VideoWriter(str(RESULTS / "test_views.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (3 * W, H))
     for n, frame in enumerate(frames):
         b = augment(scene.batch([frame]), enabled=False)
-        with torch.no_grad(), autocast("cuda"):
+        with torch.no_grad(), amp(device):
             inputs, diffuse, specular, weights = physical_inputs(srm, b)
             neural = generator(inputs).clamp(0, 1)
         neural = neural.float()

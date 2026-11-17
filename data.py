@@ -3,7 +3,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from common import CACHE, CX, CY, FOCAL, GAMMA, H, W, load_poses, pixel_rays
+from common import CACHE, CAN_Z_MIN, CX, CY, FOCAL, GAMMA, H, W, load_cans, load_poses, pixel_rays
+
+CAN_CHOICES = {"a": [1], "b": [2], "both": [1, 2]}
+
+
+def pick_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def to_linear(x):
@@ -14,11 +20,34 @@ def to_display(x):
     return x.clamp(1e-4, 1) ** (1 / GAMMA)
 
 
+def can_ids(pos, mask, cans, margin=1.2):
+    """Per-pixel can id from world position: 0 for floor and background, k + 1 for can k."""
+    ids = torch.zeros_like(mask)
+    if cans is None:
+        return ids
+    z = pos[:, 2:3]
+    for k, (x, y, radius, height) in enumerate(cans):
+        near = torch.hypot(pos[:, 0:1] - x, pos[:, 1:2] - y) < radius * margin
+        ids = torch.where(near & (z > CAN_Z_MIN) & (z < height * margin), float(k + 1), ids)
+    return ids * mask
+
+
+def select(b, which):
+    """Pixels allowed to carry specular reflection. "all" keeps every surface, floor included."""
+    if which == "all":
+        return b["mask"]
+    return sum((b["can"] == k).float() for k in CAN_CHOICES[which])
+
+
 class Scene:
-    def __init__(self, device):
+    def __init__(self, device, diffuse="diffuse"):
+        """`diffuse` names the cached diffuse buffer: "diffuse" or "diffuse_est" (label.py)."""
         self.device = device
-        names = ["rgb", "diffuse", "fbi", "vis", "depth", "normal"]
+        names = ["rgb", "fbi", "vis", "depth", "normal"]
         self.arrays = {n: np.load(CACHE / f"{n}.npy", mmap_mode="r") for n in names}
+        self.arrays["diffuse"] = np.load(CACHE / f"{diffuse}.npy", mmap_mode="r")
+        cans = load_cans()
+        self.cans = None if cans is None else cans.tolist()
         split = np.load(CACHE / "split.npz")
         self.train, self.test, self.test_angle = split["train"], split["test"], split["angle"]
         self.poses = torch.tensor(load_poses(), dtype=torch.float32, device=device)
@@ -48,6 +77,7 @@ class Scene:
             "mask": mask,
             "depth": depth,
             "pos": pos,
+            "can": can_ids(pos, mask, self.cans),
             "refl": (unit + 2 * cos * normal) * mask,
             "fci": ((1 - cos) ** 5) * mask,
             "pose": self.poses[idx],
@@ -67,7 +97,7 @@ def sample_affine(n, device, rescale):
     coordinates to original coordinates and back.
     """
     angle = torch.rand(n, device=device) * 2 * torch.pi - torch.pi  # up to 180 degrees
-    shift = (torch.rand(n, 2, device=device) * 2 - 1) * 100  # up to 100 pixels
+    shift = (torch.rand(n, 2, device=device) * 2 - 1) * 100 * W / 640  # up to 100 pixels at 640 wide
     flip_x = torch.where(torch.rand(n, device=device) < 0.5, -1.0, 1.0)
     flip_y = torch.where(torch.rand(n, device=device) < 0.5, -1.0, 1.0)
     scale = torch.ones(n, device=device)
@@ -118,7 +148,7 @@ def augment(batch, rescale=False, enabled=True):
     out = dict(batch, to_aug=to_aug)
     for key in ["rgb", "diffuse", "fbi", "refl", "fci"]:
         out[key] = F.grid_sample(batch[key], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-    for key in ["vis", "mask", "depth", "pos"]:
+    for key in ["vis", "mask", "depth", "pos", "can"]:
         out[key] = F.grid_sample(batch[key], grid, mode="nearest", padding_mode="zeros", align_corners=False)
     out["refl"] = F.normalize(out["refl"], dim=1) * out["mask"]
     return out
