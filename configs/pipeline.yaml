@@ -1,0 +1,20 @@
+# Classical pipeline constants (stages 3 to 5).
+pano: [256, 512]         # panorama rows x columns (equirectangular)
+gamma: srgb              # how video pixels are linearised: srgb | a number (linear = pixel ** gamma)
+
+label:
+  method: min            # min | median | percentile | none (min won the label ablation: figures/label_ablation.csv)
+  percentile: 0.2        # used by method: percentile (0 = min, 0.5 = median)
+  max_frames: 64         # frames used to estimate the label (evenly subsampled)
+
+weights:
+  fresnel_power: 2.0     # weight ~ F^p: brighter reflection, better signal-to-label ratio
+  cos_power: 1.0         # weight ~ cos(incidence)^p: grazing samples are stretched and pose-sensitive
+  footprint: true        # down-weight pixels whose reflection covers many panorama texels
+
+min_weight: 1.0e-3       # panorama texels with less total weight count as unobserved
+
+video:
+  stride: 3              # use every n-th frame
+  max_frames: 120
+  long_side: 1280        # frames are resized so their longer side is this many pixels

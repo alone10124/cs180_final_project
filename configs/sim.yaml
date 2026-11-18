@@ -1,0 +1,30 @@
+# Simulator randomisation for restoration training pairs (Phase 1).
+# Fit roughness_deg, strength and noise to a real capture with
+#   python -m sodacan.refine.roughness_fit --capture <run dir>
+# and centre these ranges on the fitted values.
+frames: 32               # frames per simulated video
+image: [480, 360]        # width, height of simulated frames (portrait phones: swap)
+focal: [700, 1000]       # px, uniform range
+distance: [0.22, 0.40]   # m, camera to can axis
+arc_deg: [30, 60]        # azimuth sweep of the camera path
+elevation_deg: [-20, 30] # camera elevation range relative to the can's middle; the path tilts inside it
+min_camera_z: 0.012      # m; the phone cannot go below the table the can stands on (null: can on a stand)
+tilt_cycles: [1, 3]      # up/down tilt oscillations along the arc
+jitter_mm: 3             # hand shake
+
+roughness_deg: [0.3, 2.5]
+strength: [0.6, 1.2]     # multiplier on the Fresnel reflectance (< 1: haze, ink showing through)
+ambient: [0.3, 1.0]      # label brightness relative to the room's mean radiance
+label_prob: 0.9          # fraction of samples that are a printed, clear-coated can (else bare metal, f0 below)
+metal_f0: [0.6, 0.9]
+dent_prob: 0.3
+dent_deg: [0.2, 1.5]
+noise_read: [0.001, 0.006]
+noise_shot: [0.0005, 0.004]
+motion_blur: [0.0, 0.5]  # fraction of the frame interval the shutter is open while moving
+pose_error_deg: [0.0, 0.4]
+pose_error_mm: [0.0, 1.5]
+exposure: [0.6, 1.6]
+
+hdri_dir: data/hdri      # .hdr / .exr panoramas (Poly Haven); procedural rooms are used when empty
+hdri_prob: 0.5

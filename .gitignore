@@ -5,3 +5,7 @@ __pycache__/
 cans_data/
 scenes/
 .DS_Store
+data/
+boards/
+*.egg-info/
+.pytest_cache/

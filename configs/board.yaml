@@ -1,0 +1,12 @@
+# ChArUco board the can stands on. Make a printable PNG (300 dpi, fits landscape Letter and A4) with
+#   python -m sodacan.capture.calibrate board --out boards/board.png
+# print it at 100% scale, measure one printed square with a ruler and correct square_length
+# (and marker_length by the same factor) if the printer scaled it.
+squares: [9, 6]          # squares along x, y
+square_length: 0.028     # m
+marker_length: 0.021     # m
+dictionary: DICT_5X5_100
+
+# Where the can stands, in board coordinates (metres from the board's top-left corner,
+# x to the right, y down as printed). The printed board marks this circle.
+can_centre: [0.126, 0.084]

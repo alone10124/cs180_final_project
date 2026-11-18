@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sodacan"
+version = "0.1.0"
+description = "Recover a panorama of a room from phone video of a soda can, using the can's known cylinder geometry."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "opencv-contrib-python-headless; platform_system == 'Linux'",
+    "opencv-python; platform_system != 'Linux'",
+    "pyyaml",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+metrics = ["lpips", "scikit-image"]
+demo = ["gradio"]
+all = ["pytest", "lpips", "scikit-image", "gradio"]
+
+[tool.setuptools.packages.find]
+include = ["sodacan*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: takes more than ~20 s on CPU"]
