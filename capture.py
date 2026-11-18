@@ -99,12 +99,14 @@ def fit_circles(xy, count, radius_range, rng, iterations=3000):
     return circles
 
 
-def align(poses, points, count, radius, seed=0):
-    """Similarity transform to a metric frame with the table at z = 0 and the cans at the origin.
+def table_frame(poses, points, rng):
+    """Table plane and camera focus of a capture orbiting objects on a table.
 
-    Returns (poses (N, 3, 4), cans [(x, y)]).
+    Returns (R, origin, focus, reach, extent): rows of R are the table-frame axes (z is the
+    table normal, pointing toward the cameras), so a world point p maps to R @ (p - origin);
+    focus is the point nearest every optical axis, in the table frame; reach is the median
+    horizontal camera distance from it; extent is the median spread of the points.
     """
-    rng = np.random.default_rng(seed)
     centres = poses[:, :, 3]
     extent = np.median(np.linalg.norm(points - np.median(points, axis=0), axis=1))
     normal, origin, _ = fit_plane(points, 0.01 * extent, rng)
@@ -113,13 +115,27 @@ def align(poses, points, count, radius, seed=0):
     x = np.cross(normal, [1.0, 0, 0] if abs(normal[0]) < 0.9 else [0, 1.0, 0])
     x /= np.linalg.norm(x)
     R = np.stack([x, np.cross(normal, x), normal])
-    local = (points - origin) @ R.T
     cams = (centres - origin) @ R.T
-    # where the cameras look: the point nearest to every optical axis
-    axes = np.einsum("ij,nj->ni", R, poses[:, :, 2])
-    A = np.eye(3)[None] - axes[:, :, None] * axes[:, None, :]
-    focus = np.linalg.solve(A.sum(axis=0), np.einsum("nij,nj->i", A, cams))
+    focus = nearest_to_axes(cams, np.einsum("ij,nj->ni", R, poses[:, :, 2]))
     reach = np.median(np.hypot(*(cams[:, :2] - focus[:2]).T))
+    return R, origin, focus, reach, extent
+
+
+def nearest_to_axes(centres, axes):
+    """Least-squares point nearest to every line centre + s * axis (where the cameras look)."""
+    A = np.eye(3)[None] - axes[:, :, None] * axes[:, None, :]
+    return np.linalg.solve(A.sum(axis=0), np.einsum("nij,nj->i", A, centres))
+
+
+def align(poses, points, count, radius, seed=0):
+    """Similarity transform to a metric frame with the table at z = 0 and the cans at the origin.
+
+    Returns (poses (N, 3, 4), cans [(x, y)]).
+    """
+    rng = np.random.default_rng(seed)
+    R, origin, focus, reach, extent = table_frame(poses, points, rng)
+    local = (points - origin) @ R.T
+    cams = (poses[:, :, 3] - origin) @ R.T
     raised = local[(local[:, 2] > 0.03 * extent) & (np.hypot(*(local[:, :2] - focus[:2]).T) < 0.6 * reach)]
     circles = fit_circles(raised[:, :2], count, (0.02 * reach, 0.4 * reach), rng)
     scale = radius / np.mean([c[2] for c in circles])

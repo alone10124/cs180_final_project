@@ -10,7 +10,9 @@ With a reference environment, PSNR is reported separately over observed texels
 a plausible fill is not evidence about the real room.
 
 Writes results/<input>_<method>/: filled.png (the panorama, input for walkthrough.py),
-compare.png (input, filled, reference), metrics.json.
+compare.png (input, filled, reference), metrics.json. --out-width W fills at W x W/2
+(observed texels upsampled), e.g. 2048 for Pano2Room; figures and metrics stay at the
+panorama's own size.
 """
 import argparse
 import json
@@ -61,8 +63,9 @@ def diffusion(image, hole, model, prompt, steps, seed):
     start = telea(image, hole)  # a neutral initial fill instead of the mask colour
     filled = run(start, hole)
     half = image.shape[1] // 2
+    band = max(16, image.shape[1] // 32)
     strip = np.zeros_like(hole)
-    strip[:, half - 16 : half + 16] = True
+    strip[:, half - band : half + band] = True
     rolled = run(np.roll(filled, half, axis=1), strip & np.roll(hole, half, axis=1))
     return np.roll(rolled, -half, axis=1)
 
@@ -84,28 +87,37 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--reference", default=None)
     ap.add_argument("--align", action="store_true")
+    ap.add_argument("--out-width", type=int, default=0, help="fill at this width (height = width / 2); 0 keeps the panorama size")
     args = ap.parse_args()
 
     source = RESULTS / args.input
     pano, valid = np.load(source / "pano.npy"), np.load(source / "valid.npy")
     metrics, estimate, reference = compare(pano, valid, load_reference(args.reference), align=args.align)
     hole = ~valid
+    # Fill at the output size, so generated texels keep the detail of the 1024 x 512 diffusion pass.
+    big, big_valid = estimate, valid
+    if args.out_width:
+        size = (args.out_width, args.out_width // 2)
+        big = np.clip(cv2.resize(estimate, size, interpolation=cv2.INTER_CUBIC), 0, 1)
+        big_valid = cv2.resize(valid.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
     if args.method == "telea":
-        filled = telea(estimate, hole)
+        filled = telea(big, ~big_valid)
     else:
-        filled = diffusion(estimate, hole, args.model, args.prompt, args.steps, args.seed)
-    filled = np.where(valid[..., None], estimate, filled)
+        filled = diffusion(big, ~big_valid, args.model, args.prompt, args.steps, args.seed)
+    filled = np.where(big_valid[..., None], big, filled)
+    # Figures and metrics at the panorama's own size.
+    small = filled if not args.out_width else cv2.resize(filled, hole.shape[::-1], interpolation=cv2.INTER_AREA)
 
     out = RESULTS / f"{args.input}_{args.method}"
     out.mkdir(parents=True, exist_ok=True)
     save_png(out / "filled.png", filled)
     np.save(out / "filled.npy", (filled**GAMMA).astype(np.float32))
-    panels = [side_by_side(estimate, None, valid), filled] + ([reference] if reference is not None else [])
+    panels = [side_by_side(estimate, None, valid), small] + ([reference] if reference is not None else [])
     save_png(out / "compare.png", np.vstack(panels))
     result = {"method": args.method, "filled_fraction": float(solid_angle(*hole.shape)[hole].sum())}
     if reference is not None:
-        result["psnr_observed"] = weighted_psnr(filled, reference, valid)
-        result["psnr_filled"] = weighted_psnr(filled, reference, hole)
+        result["psnr_observed"] = weighted_psnr(small, reference, valid)
+        result["psnr_filled"] = weighted_psnr(small, reference, hole)
         result["blur_deg"] = metrics["blur_deg"]
     (out / "metrics.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))

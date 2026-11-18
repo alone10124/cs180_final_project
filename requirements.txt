@@ -8,3 +8,6 @@ lpips
 diffusers
 transformers
 accelerate
+open3d
+plyfile
+viser>=1.0
