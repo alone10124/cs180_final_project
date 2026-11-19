@@ -11,7 +11,8 @@ import pytest
 import torch
 
 from sodacan.capture.pose_silhouette import (canonicalise, estimate_poses_silhouette, merge_collinear,
-                                             outline_points, params_to_c2w, c2w_to_params, rot_z)
+                                             outline_points, params_to_c2w, c2w_to_params, azimuth_from_strips,
+                                             rot_z)
 from sodacan.color import linear_to_srgb
 from sodacan.config import load_can, load_pipeline
 from sodacan.geometry.camera import Intrinsics, look_at
@@ -50,6 +51,25 @@ def test_merge_collinear_joins_a_broken_wall():
     assert len(out) == 2
     long = out[np.argmax(np.hypot(out[:, 2] - out[:, 0], out[:, 3] - out[:, 1]))]
     assert long[1] < 12 and long[3] > 118
+
+
+def test_label_match_ignores_a_view_locked_background():
+    """A shiny can: a background fixed to the view, three times stronger than the label,
+    which slides 1.5 degrees per frame. Matching raw strips is pulled to zero motion; the
+    background-free start plus the joint fit recovers the motion."""
+    rng = np.random.default_rng(0)
+    rows, cols, n, step = 24, 1440, 30, 6  # 6 columns = 1.5 degrees
+    smooth = lambda a: np.real(np.fft.ifft(np.fft.fft(a, axis=1) * (np.arange(cols) < 60), axis=1))  # noqa: E731
+    label, bg = smooth(rng.normal(size=(rows, cols))), 3 * smooth(rng.normal(size=(rows, cols)))
+    mask = np.zeros((rows, cols), np.float32)
+    mask[:, 500:940] = 1  # the band of the wall facing the camera, fixed in the view
+    true = np.arange(n) * step
+    strips = [(np.roll(label, -k, axis=1) + bg) * mask for k in true]
+    masks = [mask] * n
+    az, _ = azimuth_from_strips(strips, masks, cols)
+    assert np.max(np.abs(np.array(az) - true * 0.25)) < 0.3
+    raw, _ = azimuth_from_strips(strips, masks, cols, background_window=0, refine=False)
+    assert np.max(np.abs(np.array(raw) - true * 0.25)) > 3  # the failure being fixed
 
 
 @pytest.mark.slow

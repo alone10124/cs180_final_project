@@ -30,6 +30,7 @@ body: set `rim_radius` and `base_radius` in configs/can.yaml (about 0.027 m and 
 a 12 oz can; measure yours). Without them both equal the body radius, as in the simulator.
 """
 import math
+import warnings
 from dataclasses import dataclass, field
 
 import cv2
@@ -531,35 +532,76 @@ def smooth_track(values, ok, window=5):
     return out
 
 
-def estimate_poses_silhouette(frames_rgb, frames_lin, K, can, roi=None, azimuth_cols=1440, max_step_deg=12.0,
-                              max_residual_px=3.0, smooth=0, redetect_every=10, log=None):
-    """Poses (list of SilhouettePose) for a video of a printed can, no board needed.
-
-    frames_rgb: list of uint8 RGB frames (undistorted); frames_lin: (B, 3, H, W) linear
-    tensor of the same frames (for the label match). roi = (x0, y0, x1, y1) limits the
-    first frame's search to a box around the can. smooth = window (frames) of the temporal
-    smoothing of the five outline parameters and the azimuth; 0 turns it off. Frames must
-    be in capture order and close together (stride of a few frames at 30 fps). Every
-    redetect_every-th frame also searches for the walls from scratch, so tracking cannot
-    stay stuck on a wrong edge."""
-    out = []
-    prev = None
-    ref = ref_m = None
-    ref_n = None
-    az_prev = 0.0
-    col_deg = 360.0 / azimuth_cols
+def track_outline(frames_rgb, K, can, roi=None, max_residual_px=3.0, redetect_every=10):
+    """Pass 1: the five outline parameters of every frame (None where the outline does
+    not fit). Returns a list of (params or None, residual_px, reason)."""
+    out, prev = [], None
     for i, rgb in enumerate(frames_rgb):
         edges, dist = edge_map(rgb, roi if prev is None else None)
         p, resid, walls = fit_frame(edges, dist, K, can, prev, detect=prev is None or i % redetect_every == 0)
         if p is None:
-            out.append(SilhouettePose(None, float("inf"), info={"reason": "no wall pair"}))
+            out.append((None, float("inf"), "no wall pair"))
+        elif not resid <= max_residual_px:
+            out.append((None, resid, "outline does not fit"))
+        else:
+            prev = p
+            out.append((p, resid, ""))
+    return out
+
+
+def view_locked_background(strips, masks, window):
+    """Per frame, the masked running median of the strips over +-window frames, in the
+    canonical (camera on +x) surface frame. Anything locked to the view rather than to the
+    label stays put there: limb Fresnel brightening, highlights, the coverage edge, and much
+    of the room's reflection, which slides at half the label's speed. The label slides
+    through at the camera's angular speed and drops out of the median."""
+    G = np.stack(strips)
+    M = np.stack(masks) > 0
+    out = []
+    for i in range(len(strips)):
+        lo, hi = max(0, i - window), min(len(strips), i + window + 1)
+        g = np.where(M[lo:hi], G[lo:hi], np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN columns (never observed)
+            med = np.nanmedian(g, 0)
+        out.append(np.nan_to_num(med) * masks[i])
+    return out
+
+
+def track_azimuth(frames_lin, params, K, can, azimuth_cols=1440, max_step_deg=12.0, background_window=20,
+                  refine=True):
+    """Pass 2: the camera's angle around the can (degrees, frame 0 = 0) from the label,
+    with the view-locked background removed first (background_window = 0 keeps it).
+    Returns lists of azimuths and match scores (None where params is None)."""
+    strips, masks, idx = [], [], []
+    for i, p in enumerate(params):
+        if p is None:
             continue
-        if not resid <= max_residual_px:
-            out.append(SilhouettePose(None, resid, info={"reason": "outline does not fit"}))
-            continue
-        prev = p
-        c2w_c = params_to_c2w(p)
-        g, m = label_strip(frames_lin[i], c2w_c, K, can, azimuth_cols)
+        g, m = label_strip(frames_lin[i], params_to_c2w(p), K, can, azimuth_cols)
+        strips.append(g)
+        masks.append(m)
+        idx.append(i)
+    az_out, score_out = [None] * len(params), [None] * len(params)
+    if idx:
+        az, sc = azimuth_from_strips(strips, masks, azimuth_cols, max_step_deg, background_window, refine)
+        for j, i in enumerate(idx):
+            az_out[i], score_out[i] = az[j], sc[j]
+    return az_out, score_out
+
+
+def azimuth_from_strips(strips, masks, azimuth_cols, max_step_deg=12.0, background_window=20, refine=True):
+    """Azimuths (degrees, first = 0) and match scores of a sequence of label strips:
+    frame-to-frame tracking against a growing reference after removing the view-locked
+    background, then the joint label + background fit (refine_azimuth)."""
+    col_deg = 360.0 / azimuth_cols
+    raw = strips
+    if background_window and len(strips) > 2:
+        bg = view_locked_background(strips, masks, background_window)
+        strips = [g - b for g, b in zip(strips, bg)]
+    az_out, score_out = [], []
+    ref = ref_m = ref_n = None
+    az_prev = 0.0
+    for g, m in zip(strips, masks):
         if ref is None:
             az, score = 0.0, 1.0
             ref, ref_m, ref_n = g.copy(), m.copy(), m.copy()
@@ -574,11 +616,76 @@ def estimate_poses_silhouette(frames_rgb, frames_lin, K, can, roi=None, azimuth_
             ref_n = ref_n + ms
             ref_m = (ref_n > 0).astype(np.float32)
         az_prev = az
+        az_out.append(az)
+        score_out.append(score)
+    if refine and len(raw) > 2:
+        az_out, score_out = refine_azimuth(raw, masks, az_out, azimuth_cols)
+    return az_out, score_out
+
+
+def refine_azimuth(strips, masks, az_deg, azimuth_cols, iters=6, search_deg=4.0):
+    """Joint fit of strip_i(s) = label(s + az_i) + background(s): the label is fixed to the
+    can, the background to the view (limb Fresnel brightening, highlights, most of the
+    room's reflection). Alternates (1) the label as the mean of the background-free strips
+    shifted into frame-0 coordinates, (2) the background as the mean, in the canonical
+    frame, of what the label does not explain, (3) each azimuth by matching its
+    background-free strip to the label within +-search_deg of the last estimate. Frame 0
+    stays at 0. Returns azimuths (degrees) and match scores."""
+    col_deg = 360.0 / azimuth_cols
+    G, M = np.stack(strips), np.stack(masks)
+    k = np.array(az_deg, dtype=float) / col_deg
+    B = np.zeros_like(G[0])
+    scores = np.ones(len(G))
+    for _ in range(iters):
+        ki = np.round(k).astype(int)
+        num, den = np.zeros_like(G[0]), np.zeros_like(G[0])
+        for g, m, kk in zip(G, M, ki):
+            num += np.roll((g - B) * m, kk, axis=1)
+            den += np.roll(m, kk, axis=1)
+        L = num / np.maximum(den, 1)
+        Lm = (den > 0).astype(np.float32)
+        num, den = np.zeros_like(G[0]), np.zeros_like(G[0])
+        for g, m, kk in zip(G, M, ki):
+            w = m * np.roll(Lm, -kk, axis=1)
+            num += (g - np.roll(L, -kk, axis=1)) * w
+            den += w
+        B = num / np.maximum(den, 1)
+        new_k = k.copy()
+        for i in range(1, len(G)):
+            new_k[i], scores[i] = register_shift((G[i] - B) * M[i], M[i], L, Lm, int(search_deg / col_deg), int(round(k[i])))
+        new_k -= new_k[0]
+        done = np.max(np.abs(new_k - k)) < 0.25
+        k = new_k
+        if done:
+            break
+    return list(k * col_deg), list(scores)
+
+
+def estimate_poses_silhouette(frames_rgb, frames_lin, K, can, roi=None, azimuth_cols=1440, max_step_deg=12.0,
+                              max_residual_px=3.0, smooth=0, redetect_every=10, background_window=20, log=None):
+    """Poses (list of SilhouettePose) for a video of a printed can, no board needed.
+
+    frames_rgb: list of uint8 RGB frames (undistorted); frames_lin: (B, 3, H, W) linear
+    tensor of the same frames (for the label match). roi = (x0, y0, x1, y1) limits the
+    first frame's search to a box around the can. smooth = window (frames) of the temporal
+    smoothing of the five outline parameters and the azimuth; 0 turns it off. Frames must
+    be in capture order and close together (stride of a few frames at 30 fps). Every
+    redetect_every-th frame also searches for the walls from scratch, so tracking cannot
+    stay stuck on a wrong edge. background_window: frames on each side for the
+    view-locked background removed before the label match (see view_locked_background)."""
+    fits = track_outline(frames_rgb, K, can, roi, max_residual_px, redetect_every)
+    params = [f[0] for f in fits]
+    azs, scores = track_azimuth(frames_lin, params, K, can, azimuth_cols, max_step_deg, background_window)
+    out = []
+    for i, (p, resid, reason) in enumerate(fits):
+        if p is None:
+            out.append(SilhouettePose(None, resid, info={"reason": reason}))
+            continue
         # obs_i(s) = ref(s + az): the camera sits at +az relative to frame 0
-        c2w = rot_z(math.radians(az)) @ c2w_c
-        out.append(SilhouettePose(c2w, resid, az, score, info={"params": p}))
+        c2w = rot_z(math.radians(azs[i])) @ params_to_c2w(p)
+        out.append(SilhouettePose(c2w, resid, azs[i], scores[i], info={"params": p}))
         if log:
-            log(f"frame {i}: outline residual {resid:.2f} px, azimuth {az:+.2f} deg (match {score:.2f})")
+            log(f"frame {i}: outline residual {resid:.2f} px, azimuth {azs[i]:+.2f} deg (match {scores[i]:.2f})")
     if smooth and smooth > 1:
         ok = np.array([o.c2w is not None for o in out])
         vals = np.zeros((len(out), 6))
