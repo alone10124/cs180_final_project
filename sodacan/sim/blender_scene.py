@@ -1,6 +1,6 @@
 """Blender Cycles render of a scene exported by sodacan.sim.blender_export (photoreal validation).
 
-  blender -b -P sodacan/sim/blender_scene.py -- data/blender/scene_000 [--samples 128]
+  blender -b -P sodacan/sim/blender_scene.py -- data/blender/scene_000 [--samples 512 --denoise]
 
 Runs inside Blender's Python (bpy, numpy; no torch). Writes <scene>/blender/frame_XXXX.hdr.
 
@@ -8,7 +8,8 @@ The environment is mapped with math nodes to match geometry/equirect.py exactly
 (column from atan2(y, x), row from the polar angle, z up). The can is a smooth
 256-sided cylinder. Bare metal: Glossy BSDF (GGX). Printed can: Principled BSDF with
 the label as base colour, mapped with the same surface atlas convention
-(geometry/cylinder.py), dielectric specular with IOR 1.5. Roughness in degrees is
+(geometry/cylinder.py), dielectric specular with IOR 1.5. The wall is an open tube (no caps
+sharing its vertices, which would bend its smooth normals) with a flat grey lid on top. Roughness in degrees is
 converted to GGX roughness with r = sqrt(tan(sigma)), an approximation: the two lobes
 are not the same shape. The table is a plain diffuse plane.
 """
@@ -83,12 +84,13 @@ def can_material(spec, folder):
         shader.inputs["Roughness"].default_value = rough
         shader.inputs["IOR"].default_value = spec["material"].get("ior", 1.5)
         if spec.get("label"):
-            # surface atlas: x = (atan2(y, x) + pi) / 2pi, y = z / height (Blender image v is up)
+            # surface atlas: x = (atan2(y, x) + pi) / 2pi, y = z / height (Blender image v is up).
+            # Object coordinates have their origin at the cylinder's centre, so z runs from -height/2.
             coord = tree.nodes.new("ShaderNodeTexCoord")
             xyz = tree.nodes.new("ShaderNodeSeparateXYZ")
             tree.links.new(coord.outputs["Object"], xyz.inputs[0])
             u = math_node(tree, "MULTIPLY_ADD", math_node(tree, "ARCTAN2", xyz.outputs["Y"], xyz.outputs["X"]), 1 / (2 * math.pi), 0.5)
-            v = math_node(tree, "DIVIDE", xyz.outputs["Z"], spec["can"]["height"])
+            v = math_node(tree, "MULTIPLY_ADD", xyz.outputs["Z"], 1 / spec["can"]["height"], 0.5)
             uv = tree.nodes.new("ShaderNodeCombineXYZ")
             tree.links.new(u, uv.inputs["X"])
             tree.links.new(v, uv.inputs["Y"])
@@ -117,20 +119,47 @@ def build_camera(scene, spec):
     return camera
 
 
+def use_gpu(scene):
+    """Render on the GPU when Cycles finds one (OptiX, then CUDA, HIP, Metal, oneAPI)."""
+    try:
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+    except KeyError:
+        return
+    for kind in ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"):
+        try:
+            prefs.compute_device_type = kind
+            prefs.get_devices()
+        except (TypeError, ValueError):
+            continue
+        gpus = [d for d in prefs.devices if d.type == kind]
+        if gpus:
+            for d in prefs.devices:
+                d.use = d.type == kind
+            scene.cycles.device = "GPU"
+            print(f"Cycles on {kind}: {', '.join(d.name for d in gpus)}")
+            return
+
+
 def main():
     argv = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else sys.argv[1:]
     ap = argparse.ArgumentParser()
     ap.add_argument("scene")
     ap.add_argument("--samples", type=int, default=128)
+    ap.add_argument("--denoise", action="store_true",
+                    help="OpenImageDenoise. A clear coat reflects ~4 %%, so label removal divides path-tracing noise by ~0.04")
+    ap.add_argument("--out", default="blender", help="subfolder of the scene for the frames")
     args = ap.parse_args(argv)
-    folder = Path(args.scene)
+    folder = Path(args.scene).resolve()
     spec = json.loads((folder / "scene.json").read_text())
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
     scene.cycles.samples = args.samples
-    scene.cycles.use_denoising = False
+    use_gpu(scene)
+    scene.cycles.use_denoising = args.denoise
+    if args.denoise:
+        scene.cycles.denoiser = "OPENIMAGEDENOISE"
     scene.render.resolution_x, scene.render.resolution_y = spec["width"], spec["height"]
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "HDR"
@@ -138,11 +167,20 @@ def main():
     build_world(scene, folder / "env.hdr", spec["exposure"])
 
     can = spec["can"]
-    bpy.ops.mesh.primitive_cylinder_add(vertices=256, radius=can["radius"], depth=can["height"], location=(0, 0, can["height"] / 2))
+    # The wall has no caps: with caps sharing its vertices, smooth shading would average the
+    # caps' normals into the wall's and tilt it like a barrel (a window then reflects as a dot
+    # instead of a vertical streak). The lid is a separate flat disk.
+    bpy.ops.mesh.primitive_cylinder_add(vertices=256, radius=can["radius"], depth=can["height"], end_fill_type="NOTHING",
+                                        location=(0, 0, can["height"] / 2))
     obj = bpy.context.object
     for poly in obj.data.polygons:
-        poly.use_smooth = len(poly.vertices) == 4
+        poly.use_smooth = True
     obj.data.materials.append(can_material(spec, folder))
+    bpy.ops.mesh.primitive_circle_add(vertices=256, radius=can["radius"], fill_type="NGON", location=(0, 0, can["height"]))
+    lid = bpy.data.materials.new("lid")
+    lid.use_nodes = True
+    lid.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0.5, 0.5, 0.5, 1)
+    bpy.context.object.data.materials.append(lid)
     bpy.ops.mesh.primitive_plane_add(size=4, location=(0, 0, 0))
     table = bpy.data.materials.new("table")
     table.use_nodes = True
@@ -151,12 +189,12 @@ def main():
 
     camera = build_camera(scene, spec)
     flip = np.diag([1.0, -1.0, -1.0])  # OpenCV camera axes -> Blender (y up, z back)
-    (folder / "blender").mkdir(exist_ok=True)
+    (folder / args.out).mkdir(exist_ok=True)
     for i, pose in enumerate(spec["poses"]):
         m = np.array(pose)
         m[:3, :3] = m[:3, :3] @ flip
         camera.matrix_world = Matrix(m.tolist())
-        scene.render.filepath = str(folder / "blender" / f"frame_{i:04d}.hdr")
+        scene.render.filepath = str(folder / args.out / f"frame_{i:04d}.hdr")
         bpy.ops.render.render(write_still=True)
 
 

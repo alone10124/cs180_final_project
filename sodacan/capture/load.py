@@ -25,8 +25,11 @@ class Capture:
 
 
 def load_capture(video, phone="phone_example", board="board", cfg=None, device="cpu", stride=None, max_frames=None,
-                 long_side=None, frames_rgb=None):
-    """Decode, undistort, pose and linearise a capture. frames_rgb skips decoding (streaming)."""
+                 long_side=None, frames_rgb=None, can=None, roi=None, log=None):
+    """Decode, undistort, pose and linearise a capture. frames_rgb skips decoding (streaming).
+
+    board=None (or "none") poses the frames from the can's outline and label instead of a
+    ChArUco board (capture/pose_silhouette.py); that needs `can` and a printed can."""
     vc = (cfg or {}).get("video", {})
     phone = load_yaml(phone) if isinstance(phone, str) else phone
     if frames_rgb is None:
@@ -41,6 +44,24 @@ def load_capture(video, phone="phone_example", board="board", cfg=None, device="
     dist = np.array(phone.get("dist", [0, 0, 0, 0, 0]), dtype=np.float64)
     if np.any(dist != 0):
         frames_rgb = [cv2.undistort(f, Km, dist) for f in frames_rgb]
+    gamma = (cfg or {}).get("gamma", "srgb")
+    if board is None or str(board).lower() == "none":
+        if can is None:
+            raise ValueError("posing without a board needs the can (load_can())")
+        from sodacan.capture.pose_silhouette import estimate_poses_silhouette
+
+        lin = linearize(torch.from_numpy(np.stack(frames_rgb)).to(device).permute(0, 3, 1, 2).float() / 255, gamma)
+        poses = estimate_poses_silhouette(frames_rgb, lin, K, can, roi=roi, log=log)
+        kept = [i for i, p in enumerate(poses) if p.c2w is not None]
+        if len(kept) < 3:
+            raise RuntimeError(f"can outline fitted in only {len(kept)} of {len(frames_rgb)} frames")
+        frames = lin[kept]
+        rgb = [frames_rgb[i] for i in kept]
+        c2w = torch.tensor(np.stack([poses[i].c2w for i in kept]), dtype=torch.float32, device=device)
+        errs = [poses[i].residual_px for i in kept]
+        stats = {"decoded": len(frames_rgb), "posed": len(kept), "median_outline_px": float(np.median(errs)),
+                 "pose": "silhouette", "median_label_match": float(np.median([poses[i].azimuth_score for i in kept]))}
+        return Capture(frames, c2w, K, rgb, kept, errs, stats)
     board_obj, bcfg = load_board(board)
     poses = estimate_poses(frames_rgb, Km, np.zeros(5), board_obj, bcfg)
     kept = [i for i, p in enumerate(poses) if p.c2w is not None]
@@ -48,11 +69,10 @@ def load_capture(video, phone="phone_example", board="board", cfg=None, device="
         raise RuntimeError(f"board found in only {len(kept)} of {len(frames_rgb)} frames")
     rgb = [frames_rgb[i] for i in kept]
     arr = torch.from_numpy(np.stack(rgb)).to(device).permute(0, 3, 1, 2).float() / 255
-    gamma = (cfg or {}).get("gamma", "srgb")
     frames = linearize(arr, gamma)
     c2w = torch.tensor(np.stack([poses[i].c2w for i in kept]), dtype=torch.float32, device=device)
     errs = [poses[i].reproj_px for i in kept]
-    stats = {"decoded": len(frames_rgb), "posed": len(kept), "median_reproj_px": float(np.median(errs))}
+    stats = {"decoded": len(frames_rgb), "posed": len(kept), "median_reproj_px": float(np.median(errs)), "pose": "board"}
     return Capture(frames, c2w, K, rgb, kept, errs, stats)
 
 

@@ -4,6 +4,7 @@
   python scripts/run_pipeline.py --sim --mirror --out runs/sim_mirror         # perfect mirror, no label
   python scripts/run_pipeline.py --video can.mp4 --phone configs/phone_pixel.yaml --out runs/kitchen \
       [--reference room_pano.jpg] [--model runs/train_unet/best.pt]
+  python scripts/run_pipeline.py --video can.mp4 --no-board --phone ... --out runs/kitchen   # no ChArUco board
 
 Writes into --out:
   00_frames.png        a few input frames (linear -> sRGB, auto exposure)
@@ -50,7 +51,9 @@ def simulate(args, can, device):
 def load_real(args, can, cfg, device):
     from sodacan.capture.load import load_capture
 
-    cap = load_capture(args.video, args.phone, args.board, cfg, device=device)
+    roi = tuple(int(v) for v in args.roi.split(",")) if args.roi else None
+    cap = load_capture(args.video, args.phone, None if args.no_board else args.board, cfg, device=device, can=can,
+                       roi=roi, log=print if args.no_board else None)
     return cap.frames, cap.c2w, cap.K, cap
 
 
@@ -65,6 +68,9 @@ def main():
     ap.add_argument("--video")
     ap.add_argument("--phone", default="phone_example")
     ap.add_argument("--board", default="board")
+    ap.add_argument("--no-board", action="store_true",
+                    help="pose from the can's outline and label instead of a ChArUco board (slower, about 1 deg)")
+    ap.add_argument("--roi", help="with --no-board: x0,y0,x1,y1 box around the can in the first frame")
     ap.add_argument("--can", default="can")
     ap.add_argument("--pipeline", default="pipeline")
     ap.add_argument("--reference", help="phone/360 panorama of the room taken from the can (photo convention)")

@@ -80,3 +80,30 @@ def test_train_resume_and_infer(tmp_path):
     valid[20:40] = True
     out = enhance(model, pano * valid, valid.float(), valid)
     assert out.shape == pano.shape and (out[:, ~valid] == 0).all()
+
+
+def test_srgb_gradient_is_finite_at_zero():
+    """x ** (1/2.4) has an infinite slope at 0; where() must not turn it into a NaN gradient."""
+    from sodacan.color import linear_to_srgb
+
+    x = torch.tensor([0.0, 1e-5, 0.003, 0.5, 1.0], requires_grad=True)
+    linear_to_srgb(x).sum().backward()
+    assert torch.isfinite(x.grad).all()
+
+
+def test_losses_give_finite_gradients_with_unobserved_regions():
+    """The full loss (L1, fidelity, LPIPS) must train a model whose crops are partly unobserved.
+    A NaN gradient makes the AMP scaler skip every step, and the network then never moves."""
+    from sodacan.restore.losses import restoration_loss
+
+    torch.manual_seed(0)
+    model = build_model("unet", base=8, depth=2)
+    B, H, W = 2, 32, 64
+    valid = torch.zeros(B, H, W, dtype=torch.bool)
+    valid[:, 8:24] = True
+    batch = {"input": torch.rand(B, 3, H, W) * valid[:, None], "weight": valid.float(), "valid": valid,
+             "target": torch.rand(B, 3, H, W)}
+    loss, terms = restoration_loss(model, batch, {"fidelity": 0.05, "lpips": 0.1})
+    loss.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert torch.isfinite(loss) and grads and all(torch.isfinite(g).all() for g in grads)

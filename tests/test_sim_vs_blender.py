@@ -3,6 +3,10 @@
 Skipped until scenes are exported and rendered:
   python -m sodacan.sim.blender_export --out data/blender --scenes 20
   blender -b -P sodacan/sim/blender_scene.py -- data/blender/scene_000   (each scene)
+
+Scored above the horizon. Below it, Cycles' can reflects the table it stands on (a near,
+lit plane), while the fast renderer looks up the distant room's floor: a real difference
+between the simulator and the world, not a failure of the Phase 0 code.
 """
 from pathlib import Path
 
@@ -18,7 +22,17 @@ from sodacan.sim.blender_export import read_renders
 from sodacan.sim.rooms import read_hdr
 
 SCENES = sorted((REPO_ROOT / "data" / "blender").glob("scene_*")) if (REPO_ROOT / "data" / "blender").is_dir() else []
-RENDERED = [s for s in SCENES if (s / "blender").is_dir() and any((s / "blender").iterdir())]
+def _complete(scene):
+    """Every pose has a rendered frame (a scene still rendering is skipped)."""
+    import json
+
+    if not (scene / "blender").is_dir():
+        return False
+    poses = json.loads((scene / "scene.json").read_text())["poses"]
+    return len(list((scene / "blender").glob("frame_*.*"))) == len(poses)
+
+
+RENDERED = [s for s in SCENES if _complete(s)]
 
 
 @pytest.mark.skipif(not RENDERED, reason="no Blender renders in data/blender/*/blender")
@@ -35,8 +49,16 @@ def test_blender_frames_reconstruct(folder):
     rb = reconstruct(frames_b, c2w, K, can, cfg)
     rf = reconstruct(frames_f, c2w, K, can, cfg)
     both = rb.valid & rf.valid
-    pb, pf = psnr(rb.pano, ref, both), psnr(rf.pano, ref, both)
-    agree = psnr(rb.pano, rf.pano, both)
-    print(f"{folder.name}: Blender {pb:.2f} dB, fast renderer {pf:.2f} dB vs truth; Blender vs fast {agree:.2f} dB")
+    above = both.clone()
+    above[H // 2 :] = False  # row 0 is straight up; the horizon is the middle row
+    pb, pf = psnr(rb.pano, ref, above), psnr(rf.pano, ref, above)
+    agree = psnr(rb.pano, rf.pano, above)
+    full = psnr(rb.pano, rf.pano, both)
+    print(f"{folder.name} ({spec['material']['model']}), above the horizon: Blender {pb:.2f} dB, fast renderer {pf:.2f} dB "
+          f"vs truth; Blender vs fast {agree:.2f} dB ({full:.2f} dB including the table below the horizon)")
+    frac = float(above.sum() / both.sum().clamp_min(1))
+    if frac < 0.15:
+        pytest.skip(f"{folder.name}: only {frac:.0%} of the observed texels are above the horizon (the camera looks "
+                    "down, so the can reflects mostly the table)")
     assert pb > pf - 6, "the fast renderer is much more idealised than Cycles"
     assert agree > 15

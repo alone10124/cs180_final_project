@@ -56,12 +56,19 @@ def coverage_hint(valid, c2w):
 def process(video, phone, board, can, cfg, model=None, device="cpu", frames_rgb=None, yield_every=2):
     t0 = time.time()
     timing = {}
-    yield Update("decode", "decoding video and finding the board ...")
-    cap = load_capture(video, phone, board, cfg, device=device, frames_rgb=frames_rgb)
+    no_board = board is None or str(board).lower() == "none"
+    yield Update("decode", "decoding video and fitting the can's outline (no board; slow) ..." if no_board
+                 else "decoding video and finding the board ...")
+    cap = load_capture(video, phone, board, cfg, device=device, frames_rgb=frames_rgb, can=can)
     timing["decode+pose"] = time.time() - t0
     n = len(cap.frames)
-    yield Update("pose", f"board found in {cap.stats['posed']} of {cap.stats['decoded']} frames "
-                 f"(median reprojection {cap.stats['median_reproj_px']:.2f} px)", timing=dict(timing), frames_total=n)
+    if no_board:
+        msg = (f"can outline fitted in {cap.stats['posed']} of {cap.stats['decoded']} frames "
+               f"(median {cap.stats['median_outline_px']:.2f} px, label match {cap.stats['median_label_match']:.2f})")
+    else:
+        msg = (f"board found in {cap.stats['posed']} of {cap.stats['decoded']} frames "
+               f"(median reprojection {cap.stats['median_reproj_px']:.2f} px)")
+    yield Update("pose", msg, timing=dict(timing), frames_total=n)
     t1 = time.time()
     result = None
     for result in reconstruct_steps(cap.frames, cap.c2w, cap.K, can, cfg, chunk=4, yield_every=yield_every):

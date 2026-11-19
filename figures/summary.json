@@ -1,7 +1,21 @@
 {
   "roundtrip": {
     "psnr": 31.524208068847656,
-    "ssim": 0.9129613041877747,
+    "ssim": 0.9129611849784851,
     "coverage": 0.5595322847366333
+  },
+  "blender": {
+    "scenes": 9,
+    "median_cycles_psnr": 17.91,
+    "median_fast_psnr": 15.57,
+    "median_agreement_psnr": 18.19,
+    "median_agreement_psnr_incl_table": 14.31,
+    "scored": "above the horizon"
+  },
+  "silhouette": {
+    "posed": "40/40",
+    "median_rotation_err_deg": 18.444000000000003,
+    "median_translation_err_mm": 86.16,
+    "median_abs_azimuth_err_deg": 18.401
   }
 }

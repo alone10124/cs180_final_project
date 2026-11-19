@@ -12,7 +12,10 @@ def srgb_to_linear(x):
 def linear_to_srgb(x):
     x = x.clamp(0, 1) if torch.is_tensor(x) else np.clip(x, 0, 1)
     lib = torch if torch.is_tensor(x) else np
-    return lib.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1 / 2.4) - 0.055)
+    # the power branch only sees values where it is used: x ** (1/2.4) at 0 has an infinite
+    # derivative, and where() would turn the unused branch's 0 * inf into a NaN gradient
+    hi = x.clamp_min(0.0031308) if torch.is_tensor(x) else np.maximum(x, 0.0031308)
+    return lib.where(x <= 0.0031308, x * 12.92, 1.055 * hi ** (1 / 2.4) - 0.055)
 
 
 def linearize(x, gamma="srgb"):

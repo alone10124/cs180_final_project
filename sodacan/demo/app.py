@@ -89,7 +89,7 @@ def build(default_model=None):
             models[path] = load_model(path, device)
         return models[path]
 
-    def run(video, phone, model_path, reference, sim_state):
+    def run(video, phone, model_path, reference, sim_state, no_board=False):
         can = load_can()
         cfg = load_pipeline()
         H, W = cfg["pano"]
@@ -108,7 +108,7 @@ def build(default_model=None):
             return
         model = get_model(model_path)
         exposure = None
-        for up in process(video, phone_cfg, "board", can, cfg, model, device):
+        for up in process(video, phone_cfg, None if no_board else "board", can, cfg, model, device):
             if up.pano is None:
                 yield up.message, None, None, None, None, "", ""
                 continue
@@ -148,6 +148,7 @@ def build(default_model=None):
                 model = gr.Dropdown(["none"] + choices(str(REPO_ROOT / "runs" / "restore" / "*" / "best.pt")),
                                     value=default_model or "none", label="Restoration model", allow_custom_value=True)
                 reference = gr.Image(label="Reference room panorama (optional)", type="filepath")
+                no_board = gr.Checkbox(False, label="No board: pose from the can's outline and label (slower, about 1 degree)")
                 with gr.Row():
                     seed = gr.Number(value=7, label="Sim seed", precision=0)
                     simbtn = gr.Button("Simulated capture")
@@ -163,7 +164,7 @@ def build(default_model=None):
         simbtn.click(make_sim, [seed], [video, sim_state])
         video.upload(lambda: {}, None, sim_state)
         video.clear(lambda: {}, None, sim_state)
-        go.click(run, [video, phone, model, reference, sim_state], [status, measured, coverage, enhanced, ref_img, hint, viewer])
+        go.click(run, [video, phone, model, reference, sim_state, no_board], [status, measured, coverage, enhanced, ref_img, hint, viewer])
     return demo
 
 

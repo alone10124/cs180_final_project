@@ -40,8 +40,12 @@ def perceptual(pred, target, valid, scale):
         _LPIPS[dev] = lpips.LPIPS(net="vgg", verbose=False).to(dev).eval()
         for p in _LPIPS[dev].parameters():
             p.requires_grad_(False)
-    e = 0.18 / scale
-    m = valid[:, None].float()
-    a = linear_to_srgb((pred * e).clamp(0, 1)) * m
-    b = linear_to_srgb((target * e).clamp(0, 1)) * m
-    return _LPIPS[dev](a * 2 - 1, b * 2 - 1).mean()
+    # fp32 even under AMP: LPIPS normalises features with eps = 1e-10, which is 0 in fp16, so
+    # an all-zero (unobserved) region gives 0/0 = NaN and the gradient scaler then skips every
+    # step; the network silently never trains.
+    with torch.autocast(dev.type, enabled=False):
+        e = 0.18 / (scale.float() if torch.is_tensor(scale) else scale)
+        m = valid[:, None].float()
+        a = linear_to_srgb((pred.float() * e).clamp(0, 1)) * m
+        b = linear_to_srgb((target.float() * e).clamp(0, 1)) * m
+        return _LPIPS[dev](a * 2 - 1, b * 2 - 1).mean()
