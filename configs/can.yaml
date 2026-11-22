@@ -1,0 +1,20 @@
+# Every constant about the can lives here. Measure your can with calipers and edit.
+# A standard 12 oz can is about 66 mm wide and 122 mm tall.
+radius: 0.033            # m, radius of the straight body wall
+height: 0.122            # m, base to rim
+usable_z: [0.012, 0.104] # m, straight printed wall used for reflections (skips the base dome and the tapered neck)
+# Used only when posing without a board (capture/pose_silhouette.py): radius of the top rim and of the
+# foot where the can meets the table. Unset = radius (a straight cylinder, as in the simulator).
+# A 12 oz can is about 0.027 and 0.025.
+rim_radius: null
+base_radius: null
+
+material:
+  model: metal           # silver Pepsi can: aluminium under a thin clear coat reflects ~like bare metal
+  ior: 1.5               # clear-coat refractive index, used by model: coated
+  f0: 0.9                # reflectance at normal incidence, used by model: metal
+
+# Surface-space atlas (angle around the can x height) used for label removal and the dent map.
+atlas: [192, 512]        # rows (height), columns (angle)
+
+min_cos: 0.15            # drop samples whose incidence cosine is below this (grazing edge of the silhouette)

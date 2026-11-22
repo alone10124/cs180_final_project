@@ -84,6 +84,33 @@ SCENE=two python inpaint.py --input both --method telea       # or --method diff
 SCENE=two python walkthrough.py --input both_telea --room 5 4 2.7 --eye 0.8
 ```
 
+### Pano2Room
+
+[Pano2Room (SIGGRAPH Asia 2024)](https://github.com/TrickyGo/Pano2Room) estimates depth from a panorama, refines a mesh by filling holes from new viewpoints, and trains a 3D Gaussian Splatting scene.
+Use the exporter to turn our filled panorama into a camera-oriented RGB PNG for the authors' code:
+
+```
+python export_pano2room.py --demo
+# Or use a new result from inpaint.py:
+SCENE=two python export_pano2room.py --input both_telea
+```
+
+The demo uses the completed reflection panorama from the saved synthetic run. The default output is `results/pano2room/input_panorama.png` relative to the current scene.
+For Colab, open `pano2room_colab.ipynb`, select a GPU runtime, and run the cells in order.
+It prompts for the exported PNG if it isn't already on Drive and saves each 3D scene and walkthrough in a timestamped Drive folder.
+
+For a local CUDA run:
+
+Set up the authors' repository and checkpoints in a separate CUDA environment using their installation instructions.
+Place the exported file at `input/input_panorama.png` in that checkout, then run from its root:
+
+```
+sh scripts/run_Pano2Room.sh
+```
+
+The upstream run writes `3DGS.ply` and novel-view renders under `output/Pano2Room-results/`.
+Depth and any appearance behind occlusions come from the model. The filled regions of the input already include synthesized pixels.
+
 Own capture:
 
 ```

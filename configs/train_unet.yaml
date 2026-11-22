@@ -1,0 +1,23 @@
+# Baseline restoration model. Kaggle: notebooks/kaggle_train.ipynb runs this with --resume.
+model: {name: unet, base: 20, depth: 4}
+sim: sim                  # configs/sim.yaml
+pano: [256, 512]          # train at 256 x 512 first; 512 x 1024 only if real captures hold that detail
+data:
+  shards: data/pairs      # from python -m sodacan.sim.dataset; set on_the_fly: true to simulate instead
+  on_the_fly: false
+  pool: 128
+  fresh_per_step: 1
+crop: [64, 256]           # rows, columns of the training crops (the observed band is ~60-110 rows)
+batch: 16
+steps: 30000
+lr: 1.0e-3
+weight_decay: 0.01
+warmup: 500
+clip: 1.0
+amp: true
+loss:
+  fidelity: 0.05          # pull toward the measurement; raise if the network invents objects
+  lpips: 0.1             # perceptual term against L1 blur (the 5k-step L1-only local run came out smooth)
+val: {pairs: 48, every: 1000, seed: 0}
+ckpt_minutes: 30
+seed: 0

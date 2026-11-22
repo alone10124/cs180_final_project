@@ -8,8 +8,10 @@
   SCENE=mine python splat.py --buffer diffuse_est --align       # recover the environment
 
 Steps: fit the table plane to the sparse points (RANSAC) and make it z = 0 with z up;
-fit a circle per can to the points standing above the table; rescale so the cans have
-their real radius; then build the geometry buffers from the fitted cylinders. Lens
+find the lids as the densest height above the table, split them into one cluster per
+can, and take each can's axis from its cluster centre; rescale so the lids sit at the
+real can height; then build the geometry buffers from the fitted cylinders. The mirror
+walls give COLMAP almost no points, so the fit relies on the lids being visible. Lens
 distortion is ignored, so undistort first if the lens is wide. Check data/check_*.jpg:
 the drawn outlines must sit on the cans, otherwise every reflection direction is off.
 """
@@ -22,7 +24,6 @@ import cv2
 import numpy as np
 
 from common import ROOT
-from fit_cans import circle_fit
 from synth import write_scene
 
 
@@ -78,31 +79,41 @@ def fit_plane(points, tolerance, rng, iterations=2000):
     return normal, centre, best
 
 
-def fit_circles(xy, count, radius_range, rng, iterations=3000):
-    """RANSAC circles in the table plane, one per can; returns [(cx, cy, r)]."""
-    circles = []
-    for _ in range(count):
-        best, best_count = None, 0
-        for _ in range(iterations):
-            if len(xy) < 3:
-                break
-            cx, cy, r = circle_fit(xy[rng.choice(len(xy), 3, replace=False)])
-            if not radius_range[0] < r < radius_range[1]:
-                continue
-            inliers = np.abs(np.hypot(xy[:, 0] - cx, xy[:, 1] - cy) - r) < 0.08 * r
-            if inliers.sum() > best_count:
-                best, best_count = inliers, inliers.sum()
-        assert best is not None, "no can found; too few sparse points on the cans"
-        cx, cy, r = circle_fit(xy[best])
-        circles.append((cx, cy, r))
-        xy = xy[np.hypot(xy[:, 0] - cx, xy[:, 1] - cy) > 1.5 * r]
-    return circles
+def fit_lids(local, count, extent, focus, reach, iterations=20):
+    """Lid height and one (cx, cy, r) per can, in model units.
+
+    The lids are the densest height above the table near where the cameras look.
+    Points in that band are kept where they are dense, split into one cluster per can
+    (farthest-point start, then k-means), and r is the radius of a filled disc with
+    the cluster's spread.
+    """
+    raised = local[(local[:, 2] > 0.03 * extent) & (np.hypot(*(local[:, :2] - focus[:2]).T) < reach)]
+    hist, edges = np.histogram(raised[:, 2], bins=100)
+    top = 0.5 * (edges[np.argmax(hist)] + edges[np.argmax(hist) + 1])
+    xy = raised[np.abs(raised[:, 2] - top) < 0.05 * top][:, :2]
+    cell = np.floor(xy / (0.02 * reach)).astype(int)
+    _, inverse, counts = np.unique(cell, axis=0, return_inverse=True, return_counts=True)
+    xy = xy[counts[inverse.ravel()] >= 0.2 * counts.max()]
+    assert len(xy) >= 10 * count, "no lids found; the can tops must be visible in the photos"
+    centres = [xy[np.argmax(np.hypot(*(xy - np.median(xy, axis=0)).T))]]
+    while len(centres) < count:
+        d = np.min([np.hypot(*(xy - c).T) for c in centres], axis=0)
+        centres.append(xy[np.argmax(d)])
+    centres = np.array(centres, float)
+    for _ in range(iterations):
+        label = np.argmin([np.hypot(*(xy - c).T) for c in centres], axis=0)
+        centres = np.array([xy[label == k].mean(axis=0) for k in range(count)])
+    lids = []
+    for k in range(count):
+        spread = np.mean(np.sum((xy[label == k] - centres[k]) ** 2, axis=1))
+        lids.append((centres[k][0], centres[k][1], np.sqrt(2 * spread)))
+    return top, lids
 
 
-def align(poses, points, count, radius, seed=0):
+def align(poses, points, count, height, seed=0):
     """Similarity transform to a metric frame with the table at z = 0 and the cans at the origin.
 
-    Returns (poses (N, 3, 4), cans [(x, y)]).
+    Returns (poses (N, 3, 4), cans [(x, y)], lid radii in metres).
     """
     rng = np.random.default_rng(seed)
     centres = poses[:, :, 3]
@@ -120,13 +131,13 @@ def align(poses, points, count, radius, seed=0):
     A = np.eye(3)[None] - axes[:, :, None] * axes[:, None, :]
     focus = np.linalg.solve(A.sum(axis=0), np.einsum("nij,nj->i", A, cams))
     reach = np.median(np.hypot(*(cams[:, :2] - focus[:2]).T))
-    raised = local[(local[:, 2] > 0.03 * extent) & (np.hypot(*(local[:, :2] - focus[:2]).T) < 0.6 * reach)]
-    circles = fit_circles(raised[:, :2], count, (0.02 * reach, 0.4 * reach), rng)
-    scale = radius / np.mean([c[2] for c in circles])
-    middle = np.array([*np.mean([c[:2] for c in circles], axis=0), 0])
+    top, lids = fit_lids(local, count, extent, focus, reach)
+    scale = height / top
+    middle = np.array([*np.mean([l[:2] for l in lids], axis=0), 0])
     new = np.concatenate([np.einsum("ij,njk->nik", R, poses[:, :, :3]), (scale * (cams - middle))[:, :, None]], axis=2)
-    cans = sorted([(scale * (c[0] - middle[0]), scale * (c[1] - middle[1])) for c in circles])
-    return new, cans
+    order = np.lexsort(np.array([l[:2] for l in lids]).T[::-1])
+    cans = [(scale * (lids[i][0] - middle[0]), scale * (lids[i][1] - middle[1])) for i in order]
+    return new, cans, [scale * lids[i][2] for i in order]
 
 
 def outline(image, pose, spec):
@@ -156,7 +167,7 @@ def main():
 
     camera, by_name, points = read_colmap(args.model)
     names = sorted(by_name)
-    poses, cans = align(np.stack([by_name[n] for n in names]), points, args.cans, args.radius)
+    poses, cans, lid_radii = align(np.stack([by_name[n] for n in names]), points, args.cans, args.height)
     scale = args.width / camera["width"]
     spec = {
         "width": args.width,
@@ -184,8 +195,10 @@ def main():
     write_scene(base, spec, poses, photo, floor_from_photo=True)
     for i in np.linspace(0, len(names) - 1, min(6, len(names))).astype(int):
         cv2.imwrite(str(base / "data" / f"check_{i + 1:04d}.jpg"), outline(photo(i)[..., ::-1].copy(), poses[i], spec))
-    for name, (x, y) in zip("ab", cans):
-        print(f"can {name} at ({x:.3f}, {y:.3f}) m")
+    for name, (x, y), r in zip("ab", cans, lid_radii):
+        print(f"can {name} at ({x:.3f}, {y:.3f}) m, lid radius {r:.4f} m")
+    if not all(0.6 * args.radius < r < 1.0 * args.radius for r in lid_radii):
+        print(f"warning: lid radii should be a little under --radius {args.radius}; the lid fit or --height is off")
     print(f"wrote {base}; inspect data/check_*.jpg before using the scene")
 
 

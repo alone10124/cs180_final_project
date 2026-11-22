@@ -8,3 +8,4 @@ lpips
 diffusers
 transformers
 accelerate
+pillow

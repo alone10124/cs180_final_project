@@ -1,0 +1,10 @@
+# Replace with the output of
+#   python -m sodacan.capture.calibrate calibrate --video board_sweep.mp4 --out configs/phone_<name>.yaml
+# Intrinsics are for the full-resolution video frame; the pipeline rescales them when it resizes frames.
+width: 3840
+height: 2160
+fx: 2950.0
+fy: 2950.0
+cx: 1920.0
+cy: 1080.0
+dist: [0.0, 0.0, 0.0, 0.0, 0.0]   # OpenCV k1 k2 p1 p2 k3
