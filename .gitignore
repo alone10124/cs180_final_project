@@ -1,8 +1,32 @@
-.venv/
-cache/
-runs/
+# Python / environments
 __pycache__/
-cans_data/
-scenes/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+*.egg-info/
+.env
 .DS_Store
-third_party/
+
+# Datasets and derived caches (download / regenerate: see INPUTS.md, prepare.py)
+cans_data/
+cache/
+scenes/
+*.mp4
+
+# Training checkpoints
+runs/
+
+# Third-party code is cloned by setup_linux.sh; only our modified DiT360 pipeline is tracked
+third_party/*
+!third_party/DiT360/
+
+# Logs (prepare.log is kept: it documents the dataset preparation)
+logs/*.log
+
+# Results: keep figures and metrics, drop heavy or regenerable artefacts
+results/**/pano2room_output/
+results/**/*.ply
+results/**/*.npy
+results/**/*.npz
+results/**/*.pt
+results/**/*.pdf

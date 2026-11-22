@@ -41,8 +41,10 @@ if want chips; then
   say "chips environment: this repo + COLMAP with CUDA"
   env_exists chips || conda create -y -n chips -c conda-forge python=3.11
   conda activate chips
-  conda install -y -c conda-forge "colmap=*=*cuda*"
-  pip install -r "$ROOT/requirements.txt"
+  # pip from the environment itself: without it `pip` can fall through to the system one
+  # and install into ~/.local for another Python.
+  conda install -y -c conda-forge pip "colmap=*=*cuda*"
+  python -m pip install -r "$ROOT/requirements.txt"
   banner="$(colmap -h 2>&1 || true)"
   printf '%s\n' "$banner" | sed -n '1,3p'
   [[ "$banner" == *"with CUDA"* ]] || echo "warning: this COLMAP does not report CUDA support; dense stereo (sfm stage) needs it"
