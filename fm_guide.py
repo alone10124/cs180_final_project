@@ -109,6 +109,11 @@ def load_gt(path, rows_frac):
 
     `rows_frac`: fraction of the sphere's height the image covers from the zenith (a figure crop).
     Returns (camera-layout version, mirrored version) so the handedness can be tested both ways."""
+    if str(path).endswith(".hdr"):  # synthetic ground truth: linear radiance, already in lookup layout, full sphere
+        env = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)[..., ::-1].astype(np.float32)
+        env = cv2.resize(env, (SRM_W, SRM_H), interpolation=cv2.INTER_AREA)
+        rows = np.ones((SRM_H, SRM_W), bool)
+        return {"as_is": env, "mirrored": np.ascontiguousarray(env[:, ::-1])}, rows
     img = cv2.imread(str(path))[..., ::-1].astype(np.float32) / 255
     h_full = int(round(img.shape[0] / rows_frac))
     full = np.zeros((h_full, img.shape[1], 3), np.float32)
@@ -199,10 +204,44 @@ def splat_min(samples):
 class Guide:
     """Called by the pipeline right before scheduler.step; returns the modified velocity."""
 
-    def __init__(self, renderer, lam, stop_frac, steps, on="x0", clip=0.0):
+    def __init__(self, renderer, lam, stop_frac, steps, on="x0", clip=0.0, recur=1, seed=0,
+                 decay=None, decay_end=0.5, decay_floor=0.01):
         self.r, self.lam, self.stop, self.on = renderer, lam, int(round(stop_frac * steps)), on
+        # decay="exp": lam_i = lam * floor ** (f / decay_end) for f = i / steps < decay_end, then 0
+        self.steps, self.decay, self.decay_end, self.decay_floor = steps, decay, decay_end, decay_floor
+        if decay == "exp":
+            self.stop = min(self.stop, int(np.ceil(decay_end * steps)))
         self.clip = clip  # > 0: cap each element of the guidance step at clip * rms(v)
+        self.recur = recur  # self-recurrence: each guided step is taken this many times
+        self.seed = seed
+        self.gen = None
         self.losses, self.skipped = [], 0
+
+    def lam_at(self, i):
+        """Guidance weight at sampling step i (constant, or exponentially decaying to ~0 by decay_end)."""
+        if i >= self.stop:
+            return 0.0
+        if self.decay == "exp":
+            f = i / self.steps
+            return self.lam * self.decay_floor ** (f / self.decay_end) if f < self.decay_end else 0.0
+        return self.lam
+
+    def repeats(self, i):
+        return self.recur if self.lam_at(i) > 0 else 1
+
+    def renoise(self, x, sigma, sigma_next, n_h, n_w):
+        """Exact forward kernel of the flow from sigma_next back up to sigma (> sigma_next):
+        x_sigma = a x_next + sqrt(sigma^2 - (a sigma_next)^2) eps,  a = (1 - sigma) / (1 - sigma_next).
+        The fresh noise wraps across the azimuth seam like DiT360's circular pad columns."""
+        sigma, sigma_next = float(sigma), float(sigma_next)
+        a = (1 - sigma) / (1 - sigma_next)
+        std = max(sigma ** 2 - (a * sigma_next) ** 2, 0.0) ** 0.5
+        if self.gen is None:
+            self.gen = torch.Generator(device=x.device).manual_seed(10_000 + self.seed)
+        b, _, c = x.shape
+        eps = torch.randn((b, n_h, n_w, c), generator=self.gen, device=x.device, dtype=torch.float32)
+        eps = torch.cat([eps[:, :, -1:], eps, eps[:, :, :1]], dim=2).reshape(b, -1, c)
+        return (a * x.float() + std * eps).to(x.dtype)
 
     def __call__(self, pipe, i, sigma, latents, v, n_h, n_w):
         if self.lam == 0 and i % 4:  # prior-only run: log the loss every 4 steps only
@@ -217,7 +256,7 @@ class Guide:
             lat = lat / pipe.vae.config.scaling_factor + pipe.vae.config.shift_factor
             image = pipe.vae.decode(lat.to(pipe.vae.dtype), return_dict=False)[0][0].float() * 0.5 + 0.5
             loss, _ = self.r.loss(camera_to_lookup(image))
-            grad = torch.autograd.grad(loss, x0)[0] if self.lam > 0 and i < self.stop else None
+            grad = torch.autograd.grad(loss, x0)[0] if self.lam_at(i) > 0 else None
         self.losses.append((i, float(sigma), float(loss)))
         if grad is None:
             return v
@@ -226,7 +265,7 @@ class Guide:
             return v
         grad = torch.cat([grad[:, :, -1:], grad, grad[:, :, :1]], dim=2).reshape(b, -1, c)  # pad columns
         vf = v.float()
-        step = self.lam * vf.norm() / grad.norm().clamp(min=1e-12) * grad
+        step = self.lam_at(i) * vf.norm() / grad.norm().clamp(min=1e-12) * grad
         if self.clip > 0:
             cap = self.clip * vf.pow(2).mean().sqrt()
             step = step.clamp(-cap, cap)
@@ -263,6 +302,10 @@ def main():
     ap.add_argument("--sat", type=float, default=1.0, help="drop photo pixels at/above this display value from the loss (fix 1)")
     ap.add_argument("--clip", type=float, default=0.0, help="cap each guidance-step element at clip * rms(v) (fix 2)")
     ap.add_argument("--guide-on", choices=["x0", "xt"], default="x0", help="render the jump-to-end estimate or the noisy latent")
+    ap.add_argument("--recur", type=int, default=1, help="self-recurrence: re-noise and repeat each guided step this many times")
+    ap.add_argument("--lam-decay", choices=["none", "exp"], default="none", help="exp: lambda decays exponentially to ~0 by --decay-end")
+    ap.add_argument("--decay-end", type=float, default=0.5, help="fraction of sampling steps where the decayed lambda reaches floor, then 0")
+    ap.add_argument("--decay-floor", type=float, default=0.01, help="lambda(decay_end) / lambda_0")
     ap.add_argument("--select", choices=["cans", "above"], default="cans", help="specular pixels: fitted cans, or surfaces above --z-min")
     ap.add_argument("--z-min", type=float, default=0.008, help="metres above the ground plane for --select above")
     ap.add_argument("--diffuse", choices=["min", "texture"], default="min", help="min-colour atlas (cans) or the dataset texture (paper's robust min)")
@@ -317,7 +360,8 @@ def main():
     for lam in args.lam:
         for seed in args.seeds:
             name = f"lam{lam:g}_s{seed}"
-            guide = Guide(train, lam, args.stop_frac, args.steps, args.guide_on, args.clip)
+            guide = Guide(train, lam, args.stop_frac, args.steps, args.guide_on, args.clip, args.recur, seed,
+                          None if args.lam_decay == "none" else args.lam_decay, args.decay_end, args.decay_floor)
             t = time.time()
             image = pipe(prompt_embeds=pe, pooled_prompt_embeds=ppe, width=2048, height=1024,
                          num_inference_steps=args.steps, guidance_scale=args.cfg,

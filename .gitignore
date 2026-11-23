@@ -30,3 +30,6 @@ results/**/*.npy
 results/**/*.npz
 results/**/*.pt
 results/**/*.pdf
+
+# Per-step snapshot PNGs (the switch_snapshots_s*.png composites are kept)
+results/**/snap_s*_*.png

@@ -1,0 +1,167 @@
+{
+  "args": {
+    "input": "results/renderopt_corncho1/I_renderopt_pixel.png",
+    "switch": 0.84,
+    "seeds": [
+      0,
+      1
+    ],
+    "steps": 28,
+    "cfg": 2.75,
+    "width": 1408,
+    "height": 704,
+    "roll": 1,
+    "mask": "grey",
+    "feather": 4.0,
+    "prompt": "This is a panorama. The image shows an indoor room.",
+    "max_samples": 8000000,
+    "sat": 0.98,
+    "select": "above",
+    "z_min": 0.008,
+    "diffuse": "texture",
+    "gt": "results/paper_corncho_ref/fig5d_corncho1_ground_truth_5376x1827.jpg",
+    "gt_rows": 0.68,
+    "out": "results/sdedit_mask_corncho1_sw0.84"
+  },
+  "grey_fraction": 0.426513671875,
+  "runs": {
+    "splat_min_diffuse": {
+      "train_psnr": 19.76637077331543,
+      "test_psnr": 18.146270751953125,
+      "gain": [
+        0.9228929877281189,
+        0.7406647205352783,
+        0.7514829635620117
+      ],
+      "gt_observed": {
+        "coverage": 0.6157593895289131,
+        "coverage_upper": 0.9997617238751526,
+        "azimuth_shift_deg": 357.12,
+        "psnr": 17.994498095174077,
+        "ssim": 0.3876718178242815,
+        "blur_deg": 3.6,
+        "gain": [
+          2.8562629345622947,
+          2.1055054293238507,
+          1.6291810379984322
+        ],
+        "handedness": "mirrored"
+      }
+    },
+    "input_renderopt": {
+      "train_psnr": 19.570600509643555,
+      "test_psnr": 18.253463745117188,
+      "gain": [
+        0.22272416949272156,
+        0.24106787145137787,
+        0.30912429094314575
+      ],
+      "gt_observed": {
+        "coverage": 0.6157593895289131,
+        "coverage_upper": 0.9997617238751526,
+        "azimuth_shift_deg": 357.12,
+        "psnr": 18.348787515641636,
+        "ssim": 0.3563984415874488,
+        "blur_deg": 5.76,
+        "gain": [
+          0.6553097596237103,
+          0.7164940896412624,
+          0.7296949927635467
+        ],
+        "handedness": "mirrored"
+      },
+      "gt_all": {
+        "coverage": 0.9999999999999998,
+        "coverage_upper": 1.0,
+        "azimuth_shift_deg": 357.12,
+        "psnr": 19.037409501324564,
+        "ssim": 0.4291674476449149,
+        "blur_deg": 5.76,
+        "gain": [
+          0.64920911799294,
+          0.71496385047844,
+          0.7850487692894836
+        ],
+        "handedness": "mirrored"
+      }
+    },
+    "mask_s0": {
+      "train_psnr": 19.497364044189453,
+      "test_psnr": 18.297874450683594,
+      "gain": [
+        0.22205588221549988,
+        0.25615110993385315,
+        0.31272953748703003
+      ],
+      "gt_observed": {
+        "coverage": 0.6157593895289131,
+        "coverage_upper": 0.9997617238751526,
+        "azimuth_shift_deg": 357.12,
+        "psnr": 18.731391898934906,
+        "ssim": 0.5265316047562322,
+        "blur_deg": 5.76,
+        "gain": [
+          0.6936218971380398,
+          0.7891886152521346,
+          0.7599405515474746
+        ],
+        "handedness": "mirrored"
+      },
+      "gt_all": {
+        "coverage": 0.9999999999999998,
+        "coverage_upper": 1.0,
+        "azimuth_shift_deg": 357.12,
+        "psnr": 17.899800215354347,
+        "ssim": 0.4991251750729386,
+        "blur_deg": 5.76,
+        "gain": [
+          0.5984268146197899,
+          0.6897680849033929,
+          0.7196148316244056
+        ],
+        "handedness": "mirrored"
+      },
+      "steps_overwritten": 12,
+      "seconds": 6.5
+    },
+    "mask_s1": {
+      "train_psnr": 19.482393264770508,
+      "test_psnr": 18.258502960205078,
+      "gain": [
+        0.21201252937316895,
+        0.24075430631637573,
+        0.32167747616767883
+      ],
+      "gt_observed": {
+        "coverage": 0.6157593895289131,
+        "coverage_upper": 0.9997617238751526,
+        "azimuth_shift_deg": 357.84,
+        "psnr": 18.704384147689108,
+        "ssim": 0.49084804696873585,
+        "blur_deg": 3.6,
+        "gain": [
+          0.732064767300774,
+          0.7932442892696,
+          0.8333021684115911
+        ],
+        "handedness": "mirrored"
+      },
+      "gt_all": {
+        "coverage": 0.9999999999999998,
+        "coverage_upper": 1.0,
+        "azimuth_shift_deg": 357.84,
+        "psnr": 18.231359790205147,
+        "ssim": 0.5322975057687361,
+        "blur_deg": 5.76,
+        "gain": [
+          0.5550433782267539,
+          0.6760380216330967,
+          0.7758374254286147
+        ],
+        "handedness": "mirrored"
+      },
+      "steps_overwritten": 12,
+      "seconds": 6.2
+    }
+  }
+}

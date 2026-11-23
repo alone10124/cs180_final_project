@@ -1,0 +1,69 @@
+{
+  "args": {
+    "input": "results/renderopt_cans/I_renderopt_pixel.png",
+    "switch": 0.86,
+    "seeds": [
+      0,
+      1
+    ],
+    "steps": 28,
+    "cfg": 2.75,
+    "width": 1408,
+    "height": 704,
+    "roll": 1,
+    "mask": "grey",
+    "feather": 4.0,
+    "prompt": "This is a panorama. The image shows an indoor room.",
+    "max_samples": 8000000,
+    "sat": 0.98,
+    "select": "cans",
+    "z_min": 0.008,
+    "diffuse": "texture",
+    "gt": null,
+    "gt_rows": 1.0,
+    "out": "results/sdedit_mask_cans_sw0.86"
+  },
+  "grey_fraction": 0.4574127197265625,
+  "runs": {
+    "splat_min_diffuse": {
+      "train_psnr": 18.75507354736328,
+      "test_psnr": 17.119152069091797,
+      "gain": [
+        0.6690428256988525,
+        0.489666223526001,
+        0.7976710200309753
+      ]
+    },
+    "input_renderopt": {
+      "train_psnr": 17.96411895751953,
+      "test_psnr": 15.945392608642578,
+      "gain": [
+        0.20488305389881134,
+        0.1906006783246994,
+        0.4718509614467621
+      ]
+    },
+    "mask_s0": {
+      "train_psnr": 17.789209365844727,
+      "test_psnr": 15.96039867401123,
+      "gain": [
+        0.20475195348262787,
+        0.19961921870708466,
+        0.4870952069759369
+      ],
+      "steps_overwritten": 11,
+      "seconds": 2.5
+    },
+    "mask_s1": {
+      "train_psnr": 17.91244888305664,
+      "test_psnr": 16.06064796447754,
+      "gain": [
+        0.20776215195655823,
+        0.19861023128032684,
+        0.49234330654144287
+      ],
+      "steps_overwritten": 11,
+      "seconds": 2.1
+    }
+  }
+}

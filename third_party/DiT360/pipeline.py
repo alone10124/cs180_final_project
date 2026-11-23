@@ -926,42 +926,49 @@ class DiT360Pipeline(
                 self._current_timestep = t
                 if image_embeds is not None:
                     self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                # added: self-recurrence (re-noise and repeat a guided step; 1 = original sampler)
+                repeats = guide.repeats(i) if guide is not None and hasattr(guide, "repeats") else 1
+                for r in range(repeats):
+                    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                    timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-                noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
-
-                if do_true_cfg:
-                    if negative_image_embeds is not None:
-                        self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
-                    neg_noise_pred = self.transformer(
+                    noise_pred = self.transformer(
                         hidden_states=latents,
                         timestep=timestep / 1000,
                         guidance=guidance,
-                        pooled_projections=negative_pooled_prompt_embeds,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        txt_ids=negative_text_ids,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=text_ids,
                         img_ids=latent_image_ids,
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0]
-                    noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
-                if guide is not None:  # added: v <- v + lambda * render gradient
-                    noise_pred = guide(self, i, self.scheduler.sigmas[self.scheduler.step_index or 0], latents, noise_pred, n_h, n_w)
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    if do_true_cfg:
+                        if negative_image_embeds is not None:
+                            self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
+                        neg_noise_pred = self.transformer(
+                            hidden_states=latents,
+                            timestep=timestep / 1000,
+                            guidance=guidance,
+                            pooled_projections=negative_pooled_prompt_embeds,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            txt_ids=negative_text_ids,
+                            img_ids=latent_image_ids,
+                            joint_attention_kwargs=self.joint_attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                        noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents_dtype = latents.dtype
+                    if guide is not None:  # added: v <- v + lambda * render gradient
+                        noise_pred = guide(self, i, self.scheduler.sigmas[self.scheduler.step_index or 0], latents, noise_pred, n_h, n_w)
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    if r < repeats - 1:  # back to sigma_i with fresh noise, then redo this step
+                        latents = guide.renoise(latents, self.scheduler.sigmas[self.scheduler.step_index - 1],
+                                                self.scheduler.sigmas[self.scheduler.step_index], n_h, n_w)
+                        self.scheduler._step_index -= 1
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
