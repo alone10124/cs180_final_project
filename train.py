@@ -94,6 +94,19 @@ def train_srm(args, scene, device):
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps(vars(args), indent=2))
     model = SRMModel(args.materials, refine=not args.no_refine).to(device)
+    steps_per_epoch = max(1, len(scene.train) // args.batch)
+    planned_steps = args.max_steps or args.epochs * steps_per_epoch
+    print(
+        f"SRM training: {len(scene.train)} frames, {steps_per_epoch} steps/epoch, "
+        f"{planned_steps} steps ({planned_steps / steps_per_epoch:.2f} epochs), device={device}",
+        flush=True,
+    )
+    if planned_steps < 5 * steps_per_epoch:
+        print(
+            "WARNING: fewer than 5 epochs is a pipeline test, not a converged SRM reconstruction; "
+            "the paper uses 40 epochs.",
+            flush=True,
+        )
     disc = Discriminator().to(device) if args.lambda_g else None
     perceptual = Perceptual().to(device) if args.lambda_p else None
     net_params = list(model.material.parameters())

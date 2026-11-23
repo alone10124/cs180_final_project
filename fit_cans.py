@@ -1,7 +1,8 @@
-"""Locate the cans in the scanned mesh and write cache/cans.json (run once, after prepare.py).
+"""Locate the two horizontal cans in the released Cans mesh.
 
-Each can is modelled as a vertical cylinder: x, y of the axis, radius, height.
-The ids follow the sorted x coordinate: can "a" has the smaller x.
+The public sequence has cans lying on the carpet, not upright cylinders.  Each
+can is represented by a 3D centre, unit axis, radius and half-length.  The old
+vertical-cylinder fit silently selected the wrong surface regions.
 """
 import argparse
 import json
@@ -18,9 +19,10 @@ def circle_fit(xy):
     return cx, cy, np.sqrt(c + cx**2 + cy**2)
 
 
-def fit_cans(vertices, count=2, z_min=0.025, extent=0.2, iterations=50):
-    """Cluster raised vertices in XY with k-means, then fit a circle to each cluster's wall."""
-    raised = vertices[(vertices[:, 2] > z_min) & (np.abs(vertices[:, :2]).max(axis=1) < extent)]
+def fit_cans(vertices, count=2, z_min=0.015, extent=0.2, iterations=50):
+    """Cluster raised vertices in XY, then fit an arbitrarily oriented cylinder."""
+    finite = np.isfinite(vertices).all(axis=1)
+    raised = vertices[finite & (vertices[:, 2] > z_min) & (np.abs(vertices[:, :2]).max(axis=1) < extent)]
     xy = raised[:, :2]
     centres = [xy[np.argmin(xy[:, 0])]]
     while len(centres) < count:
@@ -32,12 +34,30 @@ def fit_cans(vertices, count=2, z_min=0.025, extent=0.2, iterations=50):
         centres = np.array([xy[label == k].mean(axis=0) for k in range(count)])
     cans = []
     for k in range(count):
-        points = raised[label == k]
-        height = np.quantile(points[:, 2], 0.99)
-        wall = points[(points[:, 2] > 0.2 * height) & (points[:, 2] < 0.8 * height)]
-        cx, cy, radius = circle_fit(wall[:, :2])
-        cans.append({"x": float(cx), "y": float(cy), "radius": float(radius), "height": float(height)})
-    return sorted(cans, key=lambda c: c["x"])
+        points = raised[label == k].astype(np.float64)
+        centre = points.mean(axis=0)
+        centred = points - centre
+        # A can's long principal component is its cylinder axis.
+        _, vectors = np.linalg.eigh(centred.T @ centred / len(centred))
+        axis = vectors[:, -1]
+        if axis[0] < 0:
+            axis = -axis
+        axial = np.einsum("ij,j->i", centred, axis)
+        radial = np.linalg.norm(centred - axial[:, None] * axis, axis=1)
+        lo, hi = np.quantile(axial, [0.01, 0.99])
+        centre = centre + 0.5 * (lo + hi) * axis
+        # The mesh contains end caps and some interior samples; an upper radial
+        # quantile is more stable than the median for the outer wall.
+        radius = np.quantile(radial, 0.78)
+        cans.append(
+            {
+                "center": [float(v) for v in centre],
+                "axis": [float(v) for v in axis],
+                "radius": float(radius),
+                "half_length": float(0.5 * (hi - lo)),
+            }
+        )
+    return sorted(cans, key=lambda c: c["center"][1])
 
 
 def main():
@@ -50,8 +70,13 @@ def main():
     CACHE.mkdir(exist_ok=True)
     (CACHE / "cans.json").write_text(json.dumps(cans, indent=2))
     for name, can in zip("ab", cans):
-        print(f"can {name}: centre ({can['x']:.3f}, {can['y']:.3f}) radius {can['radius']:.3f} height {can['height']:.3f}")
-    print("a standard can is 0.033 m in radius and 0.122 m tall; check the fit against that")
+        centre = ", ".join(f"{v:.3f}" for v in can["center"])
+        axis = ", ".join(f"{v:.3f}" for v in can["axis"])
+        print(
+            f"can {name}: centre ({centre}) axis ({axis}) "
+            f"radius {can['radius']:.3f} length {2 * can['half_length']:.3f}"
+        )
+    print("a standard can is about 0.033 m in radius and 0.122 m long; check the fit against that")
 
 
 if __name__ == "__main__":

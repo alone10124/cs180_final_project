@@ -70,14 +70,24 @@ def finalize(total, weight):
     return np.clip(pano, 0, None).astype(np.float32), valid
 
 
-def srm_environment(model, scene, frames, cans):
-    """The trained basis panorama that the selected surface uses most, and each basis's share."""
+def srm_environment(model, scene, frames, cans, share_frames=16):
+    """The trained basis panorama that the selected surface uses most, and each basis's share.
+
+    Basis selection does not need all ~2,000 full-resolution frames.  Sampling
+    evenly across the capture makes CPU evaluation tens of times faster while
+    preserving the material-share estimate used only to choose a panorama.
+    """
+    frames = np.asarray(frames)
+    if share_frames and len(frames) > share_frames:
+        sample = np.linspace(0, len(frames) - 1, share_frames).round().astype(int)
+        frames = frames[sample]
     share = torch.zeros(len(model.srm), device=scene.device)
     with torch.no_grad():
-        for idx in chunks(frames):
+        for batch_no, idx in enumerate(chunks(frames), 1):
             b = scene.batch(idx)
             m = observed(b, cans)[:, None].float()
             share += (model.material(b["diffuse"]) * m).sum(dim=(0, 2, 3))
+            print(f"selecting SRM basis: {min(batch_no * 8, len(frames))}/{len(frames)} frames", flush=True)
     share = (share / share.sum().clamp(min=1)).cpu().numpy()
     best = int(share.argmax())
     return model.srm[best].detach().permute(1, 2, 0).cpu().numpy(), share

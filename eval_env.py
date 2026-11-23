@@ -17,12 +17,16 @@ from envmap import accumulate, compare, finalize, load_reference, save_png, side
 from train import load_srm
 
 
-def evaluate_run(scene, run, reference, align=False):
+def evaluate_run(scene, run, reference, align=False, max_frames=64):
     """Returns (metrics, pano, valid, estimate_display, reference_display)."""
     saved = json.loads((RUNS / run / "args.json").read_text())
     model = load_srm(scene.device, name=run)
     centre = np.load(CACHE / "split.npz")["centre"]
     frames = select_views(load_poses(), centre, scene.train, saved["views"], saved["view_select"], saved["seed"])
+    if max_frames and len(frames) > max_frames:
+        take = np.linspace(0, len(frames) - 1, max_frames).round().astype(int)
+        frames = np.asarray(frames)[take]
+    print(f"evaluating {len(frames)} frames", flush=True)
     _, valid = finalize(*accumulate(scene, frames, saved["cans"]))
     pano, share = srm_environment(model, scene, frames, saved["cans"])
     metrics, estimate, ref = compare(pano, valid, reference, align=align)
@@ -35,10 +39,13 @@ def main():
     ap.add_argument("--run", default="srm")
     ap.add_argument("--reference", default=None)
     ap.add_argument("--align", action="store_true")
+    ap.add_argument("--max-frames", type=int, default=64, help="evenly sampled evaluation frames; 0 uses all")
     args = ap.parse_args()
 
     scene = Scene(pick_device())
-    metrics, pano, valid, estimate, reference = evaluate_run(scene, args.run, load_reference(args.reference), args.align)
+    metrics, pano, valid, estimate, reference = evaluate_run(
+        scene, args.run, load_reference(args.reference), args.align, args.max_frames
+    )
     out = RESULTS / args.run
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / "pano.npy", pano)

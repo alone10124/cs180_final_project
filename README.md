@@ -59,6 +59,17 @@ SCENE=two python train.py srm --run srm_a_32 --cans a --views 32 --max-steps 800
 SCENE=two python eval_env.py --run srm_a_32
 ```
 
+Optional renderer-guided rectified-flow refinement of that reconstructed SRM:
+
+```
+SCENE=two python flow_refine.py --srm-run srm_a_32 --run srm_a_32_flow
+SCENE=two python eval_env.py --run srm_a_32_flow
+```
+
+This minimal add-on learns a small scene-specific flow prior around the paper's
+initial SRM, then guides its ODE using the error between rendered and captured
+frames. It does not use the reference environment during training.
+
 Adam moves a panorama texel by at most `--lr-srm` (default 1e-3) per step, and a texel only moves when a frame that sees it is in the batch.
 With many views and a short `--max-steps` the panoramas stay dark; raise `--lr-srm` or the step budget until `gain` in `metrics.json` stops falling.
 
