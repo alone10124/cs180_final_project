@@ -9,3 +9,4 @@ data/
 boards/
 *.egg-info/
 .pytest_cache/
+kaggle_outputs/

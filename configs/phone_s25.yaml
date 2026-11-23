@@ -1,0 +1,12 @@
+# Galaxy S25+ main camera, 12 MP photos (portrait), from the ChArUco board in the one_can,
+# one_can_1 and one_can_2 photos (pinhole, square pixels, centred principal point; RMS 2.55 px
+# over 39 views). The 50 MP mode (6120 x 8160) has the same aspect ratio and field of view:
+# scripts/run_noboard.py scales this to the photo size.
+width: 3000
+height: 4000
+fx: 2714.2
+fy: 2714.2
+cx: 1500.0
+cy: 2000.0
+dist: [0.0, 0.0, 0.0, 0.0, 0.0]
+lens_model: pinhole

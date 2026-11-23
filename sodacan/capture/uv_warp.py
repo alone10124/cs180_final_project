@@ -11,11 +11,12 @@ from sodacan.geometry.camera import project
 
 
 @torch.no_grad()
-def warp_to_surface(frames, c2w, K, can, rows=None, cols=None, chunk=8):
+def warp_to_surface(frames, c2w, K, can, rows=None, cols=None, chunk=8, pixel_mask=None):
     """Sample frames (B, 3, H, W) at every atlas texel of the can wall.
 
     Returns obs (B, 3, rows, cols) and valid (B, rows, cols): the texel faces the camera
-    at better than can.min_cos and projects inside the image.
+    at better than can.min_cos and projects inside the image (and, with pixel_mask (B, H, W)
+    bool, onto a pixel the mask keeps, e.g. one not hidden behind another can).
     """
     rows = rows or can.atlas[0]
     cols = cols or can.atlas[1]
@@ -35,6 +36,9 @@ def warp_to_surface(frames, c2w, K, can, rows=None, cols=None, chunk=8):
         ok = (cos > can.min_cos) & inside & (z > 0)
         grid = torch.stack([uv[..., 0] / (K.width - 1) * 2 - 1, uv[..., 1] / (K.height - 1) * 2 - 1], -1)
         sampled = F.grid_sample(fr, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        if pixel_mask is not None:
+            pm = pixel_mask[i : i + chunk, None].float()
+            ok = ok & (F.grid_sample(pm, grid, mode="nearest", padding_mode="zeros", align_corners=True)[:, 0] > 0.5)
         obs.append(sampled * ok[:, None])
         valid.append(ok)
     return torch.cat(obs), torch.cat(valid)

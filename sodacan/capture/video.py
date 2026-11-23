@@ -5,17 +5,18 @@ import cv2
 import numpy as np
 
 
-def read_frames(path, stride=1, max_frames=None, long_side=None):
+def read_frames(path, stride=1, max_frames=None, long_side=None, on_frame=None):
     """RGB uint8 frames (list of (H, W, 3)), the source fps and the original (width, height).
 
-    path is a video file or a folder of images (sorted by name).
+    path is a video file or a folder of images (sorted by name). on_frame(rgb) is called on
+    every kept frame at full resolution, before it is resized (e.g. to find a small board).
     """
     path = Path(path)
     if path.is_dir():
         files = sorted(p for p in path.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff"))[::stride]
         if max_frames:
             files = files[:max_frames]
-        frames = [cv2.imread(str(f))[..., ::-1] for f in files]
+        frames = [_keep(cv2.imread(str(f))[..., ::-1], long_side, on_frame) for f in files]
         fps = 0.0
     else:
         cap = cv2.VideoCapture(str(path))
@@ -31,19 +32,25 @@ def read_frames(path, stride=1, max_frames=None, long_side=None):
                 ok, f = cap.retrieve()
                 if not ok:
                     break
-                frames.append(f[..., ::-1])
+                frames.append(_keep(f[..., ::-1], long_side, on_frame))
                 if max_frames and len(frames) >= max_frames:
                     break
             i += 1
         cap.release()
     if not frames:
         raise IOError(f"no frames read from {path}")
-    size = (frames[0].shape[1], frames[0].shape[0])
+    return [np.ascontiguousarray(f) for f, _ in frames], fps, frames[0][1]
+
+
+def _keep(rgb, long_side, on_frame):
+    """(frame resized so its longer side is at most long_side, original (width, height))."""
+    size = (rgb.shape[1], rgb.shape[0])
+    if on_frame is not None:
+        on_frame(rgb)
     if long_side and max(size) > long_side:
         scale = long_side / max(size)
-        new = (round(size[0] * scale), round(size[1] * scale))
-        frames = [cv2.resize(f, new, interpolation=cv2.INTER_AREA) for f in frames]
-    return [np.ascontiguousarray(f) for f in frames], fps, size
+        rgb = cv2.resize(rgb, (round(size[0] * scale), round(size[1] * scale)), interpolation=cv2.INTER_AREA)
+    return rgb, size
 
 
 def write_video(path, frames_rgb, fps=30):

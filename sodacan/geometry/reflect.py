@@ -26,6 +26,29 @@ class PixelGeometry:
     fresnel: torch.Tensor   # (B, H, W)
 
 
+def reflects_other_can(geom, c2w_self, c2w_others, can):
+    """(B, H, W) bool: pixels of this can whose mirror reflection hits another can (its wall
+    or a lid) instead of the room. Close together, chrome cans show each other: those pixels
+    carry a neighbour's label, not the environment, and are wrong for both the label estimate
+    and the room. geom: can_geometry of this can for the B cameras c2w_self (B, 4, 4) in its
+    frame; c2w_others: list of (B, 4, 4) for the same cameras in each other can's frame."""
+    t = torch.where(geom.hit, geom.t, torch.zeros_like(geom.t))
+    o = c2w_self[:, None, None, :3, 3]
+    p = o + t[..., None] * geom.view          # hit points, this can's frame
+    out = torch.zeros_like(geom.hit)
+    for other in c2w_others:
+        T = other @ torch.linalg.inv(c2w_self)  # this can's frame -> the other's, per camera
+        Rm, tv = T[:, None, None, :3, :3], T[:, None, None, :3, 3]
+        q = (Rm @ p[..., None])[..., 0] + tv
+        r = (Rm @ geom.reflected[..., None])[..., 0]
+        q = q + 1e-4 * r
+        _, hw = cylinder.intersect(q, r, can.radius, 0.0, can.height)
+        _, ht = cylinder.intersect_disk(q, r, can.radius, can.height)
+        _, hb = cylinder.intersect_disk(q, r, can.radius, 0.0)
+        out |= hw | ht | hb
+    return out & geom.hit
+
+
 def can_geometry(c2w, K, can, dent=None, ss=1):
     """Ray-cylinder intersection, normals and reflections for every pixel of B cameras."""
     o, d = world_rays(c2w, K, ss)

@@ -18,8 +18,18 @@ from sodacan.capture.video import read_frames
 from sodacan.config import load_can
 
 
-def calibrate(frames_rgb, board, min_corners=12, max_views=60):
-    detector = cv2.aruco.CharucoDetector(board)
+LENS_MODELS = {
+    "full": 0,  # k1 k2 p1 p2 k3: overfits when the board stays near the image centre
+    "fix_k3": cv2.CALIB_FIX_K3,
+    "radial": cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST,  # k1 k2 only
+    "pinhole": cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST,
+}
+
+
+def calibrate(frames_rgb, board, min_corners=12, max_views=60, model="full", fix_principal_point=False, square_pixels=False):
+    from sodacan.capture.pose_charuco import make_detector
+
+    detector = make_detector(board)
     objs, imgs = [], []
     for f in frames_rgb:
         gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
@@ -35,9 +45,22 @@ def calibrate(frames_rgb, board, min_corners=12, max_views=60):
         keep = np.linspace(0, len(objs) - 1, max_views).round().astype(int)
         objs, imgs = [objs[i] for i in keep], [imgs[i] for i in keep]
     h, w = frames_rgb[0].shape[:2]
-    rms, K, dist, _, _ = cv2.calibrateCamera(objs, imgs, (w, h), None, None)
+    flags = LENS_MODELS[model]
+    K0 = None
+    if fix_principal_point:
+        flags |= cv2.CALIB_FIX_PRINCIPAL_POINT | cv2.CALIB_USE_INTRINSIC_GUESS
+        f0 = 0.8 * max(w, h)
+        K0 = np.array([[f0, 0, w / 2], [0, f0, h / 2], [0, 0, 1]], dtype=np.float64)
+    if square_pixels:  # fx = fy: a phone's pixels are square, and a few views cannot tell otherwise
+        flags |= cv2.CALIB_FIX_ASPECT_RATIO
+        if K0 is None:
+            f0 = 0.8 * max(w, h)
+            K0 = np.array([[f0, 0, w / 2], [0, f0, h / 2], [0, 0, 1]], dtype=np.float64)
+            flags |= cv2.CALIB_USE_INTRINSIC_GUESS
+    rms, K, dist, _, _ = cv2.calibrateCamera(objs, imgs, (w, h), K0, np.zeros(5), flags=flags)
     return {"width": w, "height": h, "fx": float(K[0, 0]), "fy": float(K[1, 1]), "cx": float(K[0, 2]),
-            "cy": float(K[1, 2]), "dist": [float(x) for x in dist.ravel()[:5]], "rms_px": float(rms), "views": len(objs)}
+            "cy": float(K[1, 2]), "dist": [float(x) for x in dist.ravel()[:5]], "rms_px": float(rms), "views": len(objs),
+            "lens_model": model}
 
 
 def main():
@@ -52,6 +75,8 @@ def main():
     c.add_argument("--out", required=True)
     c.add_argument("--board", default="board")
     c.add_argument("--stride", type=int, default=10)
+    c.add_argument("--model", choices=sorted(LENS_MODELS), default="full", help="lens distortion model")
+    c.add_argument("--fix-principal-point", action="store_true", help="hold the principal point at the image centre")
     args = ap.parse_args()
 
     board, cfg = load_board(args.board)
@@ -64,7 +89,7 @@ def main():
         print(f"wrote {args.out}: {w * 100:.1f} x {h * 100:.1f} cm at {args.dpi} dpi; print at 100% scale")
         return
     frames, _, _ = read_frames(args.video, stride=args.stride)
-    result = calibrate(frames, board)
+    result = calibrate(frames, board, model=args.model, fix_principal_point=args.fix_principal_point)
     Path(args.out).write_text(yaml.safe_dump(result, sort_keys=False))
     print(f"RMS reprojection {result['rms_px']:.3f} px over {result['views']} views -> {args.out}")
 

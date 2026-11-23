@@ -416,11 +416,11 @@ def fit_cost(p, dist, K, can, walls, f_scale=1.5):
 
 
 def fit_frame(edges, dist, K, can, prev=None, detect=True, elevations_deg=(-5, 5, 15, 25, 35, 50),
-              orbit_deg=(-6, -3, -1.5, 1.5, 3, 6), track_ok_px=1.5):
+              orbit_deg=(-6, -3, -1.5, 1.5, 3, 6), track_ok_px=1.5, wall_pairs=None):
     """Fit one frame and keep the lowest robust cost over several starts: the previous pose
     (walls tracked near its projected limbs), and, when detect is set or tracking fails,
-    each candidate wall pair at several assumed elevations; then orbited restarts of the
-    best. Returns params, median residual (px), walls."""
+    each candidate wall pair at several assumed elevations (wall_pairs: these instead of
+    detect_walls); then orbited restarts of the best. Returns params, median residual (px), walls."""
     starts = []
     if prev is not None:
         walls = track_walls(edges, params_to_c2w(prev), K, can)
@@ -430,7 +430,7 @@ def fit_frame(edges, dist, K, can, prev=None, detect=True, elevations_deg=(-5, 5
                 _, r = refine(prev, dist, K, can, walls, max_nfev=40, coarse=False)
                 detect = r > track_ok_px
     if detect or not starts:
-        for walls in detect_walls(edges, K):
+        for walls in (detect_walls(edges, K) if wall_pairs is None else wall_pairs):
             for e in elevations_deg:
                 starts.append((c2w_to_params(initial_pose(walls, math.radians(e), K, can)), walls, True))
     best = None
@@ -698,3 +698,175 @@ def estimate_poses_silhouette(frames_rgb, frames_lin, K, can, roi=None, azimuth_
                 o.c2w = rot_z(math.radians(vals[k, 5])) @ params_to_c2w(vals[k, :5])
                 o.azimuth_deg = float(vals[k, 5])
     return out
+
+
+# ----------------------------------------------------------------------------- can on a board
+
+def fit_can_offset(frames_rgb, c2w, K, can, max_frames=24, search_m=0.03, step_m=0.0025, log=None):
+    """Where the can really stands on the board. Board poses place the can at the board's
+    printed circle (configs/board*.yaml can_centre); a can put down by hand is off by a
+    centimetre or so. Slide the can in the table plane (dx, dy) until its walls and rim
+    (not its foot, which stands among the board's squares) lie on image edges, summed over
+    frames. Returns (dx, dy) in metres and the median outline distance before and after."""
+    idx = np.linspace(0, len(frames_rgb) - 1, min(max_frames, len(frames_rgb))).round().astype(int)
+    data = []
+    for i in idx:
+        _, dist = edge_map(frames_rgb[i])
+        M = np.asarray(c2w[i], dtype=np.float64)
+        data.append((dist, M, M[:3, 3]))
+
+    def cost(d, robust=True):
+        off = np.array([d[0], d[1], 0.0])
+        res = []
+        for dist, M, C in data:
+            P, w = outline_points(C - off, can)
+            keep = P[:, 2] > 0.004  # drop the base ring
+            uv, z = project_np(P[keep] + off, M, K)
+            r = sample_dist(dist, uv) * w[keep]
+            res.append(r[z > 0])
+        r = np.concatenate(res)
+        return float(np.mean(np.minimum(r, 6.0) ** 2)) if robust else float(np.median(r))
+
+    g = np.arange(-search_m, search_m + 1e-9, step_m)
+    grid = np.array([[cost((x, y)) for x in g] for y in g])
+    iy, ix = np.unravel_index(np.argmin(grid), grid.shape)
+    best = np.array([g[ix], g[iy]])
+    for s in (step_m / 2, step_m / 4, step_m / 8):  # local refinement
+        cands = [best + np.array([a, b]) * s for a in (-1, 0, 1) for b in (-1, 0, 1)]
+        best = min(cands, key=cost)
+    before, after = cost((0, 0), robust=False), cost(best, robust=False)
+    if log:
+        log(f"can offset on the board: dx {best[0] * 1000:+.1f} mm, dy {best[1] * 1000:+.1f} mm; "
+            f"median outline distance {before:.2f} -> {after:.2f} px")
+    return best, before, after
+
+
+def shift_world(c2w, offset):
+    """Camera poses in the frame of a can moved by offset = (dx, dy) in the table plane."""
+    T = np.eye(4)
+    T[:2, 3] = -np.asarray(offset)[:2]
+    return T @ np.asarray(c2w)
+
+
+def _edge_data(frames_rgb, c2w, max_frames):
+    idx = np.linspace(0, len(frames_rgb) - 1, min(max_frames, len(frames_rgb))).round().astype(int)
+    data = []
+    for i in idx:
+        _, dist = edge_map(frames_rgb[i])
+        M = np.asarray(c2w[i], dtype=np.float64)
+        data.append((dist, M, M[:3, 3]))
+    return data
+
+
+def _outline_cost(data, K, can, d, robust=True):
+    """Mean clipped squared distance (or median distance) of the walls and rim of a can
+    standing at d = (dx, dy) to the nearest image edge, over the frames in data."""
+    off = np.array([d[0], d[1], 0.0])
+    res = []
+    for dist, M, C in data:
+        P, w = outline_points(C - off, can)
+        keep = P[:, 2] > 0.004  # drop the base ring
+        uv, z = project_np(P[keep] + off, M, K)
+        r = sample_dist(dist, uv) * w[keep]
+        res.append(r[z > 0])
+    r = np.concatenate(res)
+    return float(np.mean(np.minimum(r, 6.0) ** 2)) if robust else float(np.median(r))
+
+
+def locate_cans(frames_rgb, c2w, K, can, count=1, x_range=(-0.13, 0.13), y_range=(-0.09, 0.09), step=0.005,
+                max_frames=24, log=None):
+    """Where `count` cans stand on the board, when they were not put on the printed circle.
+    Grid search over the table plane (world frame of the board poses) for positions whose
+    projected walls and rim lie on image edges in all frames, then local refinement. Later
+    cans must stand at least a can diameter away from earlier ones. Returns a list of
+    (dx, dy) offsets in metres and their median outline distance (px)."""
+    data = _edge_data(frames_rgb, c2w, max_frames)
+    xs = np.arange(x_range[0], x_range[1] + 1e-9, step)
+    ys = np.arange(y_range[0], y_range[1] + 1e-9, step)
+    grid = np.array([[_outline_cost(data, K, can, (x, y)) for x in xs] for y in ys])
+    found = []
+    for _ in range(count):
+        g = grid.copy()
+        for f in found:
+            X, Y = np.meshgrid(xs, ys)
+            g[np.hypot(X - f[0], Y - f[1]) < 2 * can.radius + 0.005] = np.inf
+        iy, ix = np.unravel_index(np.argmin(g), g.shape)
+        best = np.array([xs[ix], ys[iy]])
+        for s in (step / 2, step / 4, step / 8, step / 16):
+            cands = [best + np.array([a, b]) * s for a in (-1, 0, 1) for b in (-1, 0, 1)]
+            best = min(cands, key=lambda d: _outline_cost(data, K, can, d))
+        found.append(best)
+    out = [(f, _outline_cost(data, K, can, f, robust=False)) for f in found]
+    if log:
+        for k, (f, med) in enumerate(out):
+            log(f"can {k}: at dx {f[0] * 1000:+.1f} mm, dy {f[1] * 1000:+.1f} mm from the printed circle; "
+                f"median outline distance {med:.2f} px")
+    return out
+
+
+# ----------------------------------------------------------------------------- photos the board pose missed
+
+def colour_strip(frame_lin, c2w, K, can, cols=720):
+    """Surface-space strip of one frame for the label match: log R, G, B, each with its
+    per-row mean removed, stacked (3 * rows, cols), and the mask. Colour matters: a window
+    or door frame (the usual false outline) is grey, the label is not."""
+    fr = frame_lin[None]
+    pose = torch.tensor(np.asarray(c2w), dtype=torch.float32, device=fr.device)[None]
+    rows = max(16, cols // 8)
+    obs, valid = warp_to_surface(fr, pose, K, can, rows=rows, cols=cols)
+    lo, hi = can.usable_z
+    hgt = can.height * (1 - (torch.arange(rows, device=fr.device) + 0.5) / rows)
+    m = (valid[0] & ((hgt > lo) & (hgt < hi))[:, None]).float()
+    g = torch.log(obs[0].clamp_min(1e-4))
+    g = (g - (g * m).sum(2, keepdim=True) / m.sum(1, keepdim=True).clamp_min(1)) * m
+    return g.reshape(3 * rows, cols).cpu().numpy(), m.repeat(3, 1).cpu().numpy()
+
+
+def label_reference(strips, masks):
+    """Label in the can frame from strips of frames with known poses: the per-texel median,
+    which keeps the print and drops most reflections (they move with the view)."""
+    G, M = np.stack(strips), np.stack(masks) > 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ref = np.nanmedian(np.where(M, G, np.nan), 0)
+    ref_m = M.any(0).astype(np.float32)
+    return np.nan_to_num(ref) * ref_m, ref_m
+
+
+def pose_from_outline_and_label(rgb, frame_lin, K, can, ref, ref_m, dist_range=(0.05, 3.0), max_residual_px=3.0,
+                                top_k=6):
+    """Pose of one photo with no board in view, in the can frame of the label reference.
+
+    Each candidate wall pair is fitted on its own (the outline gives five parameters: all but
+    the angle around the can); fits off the outline or at a camera distance outside
+    dist_range are dropped; the label match over the full circle gives the remaining angle,
+    and the candidate whose label matches best wins. Window and door frames make parallel
+    edge pairs that fit an outline as well as the can does, so the outline alone cannot
+    pick. Returns (c2w or None, info dict with the match score; the caller thresholds it)."""
+    edges, dist = edge_map(rgb)
+    pairs = detect_walls(edges, K, top_k=top_k)
+    cols = ref.shape[1]
+    best, tried = None, []
+    for walls in pairs:
+        p, resid, _ = fit_frame(edges, dist, K, can, wall_pairs=[walls])
+        if p is None:
+            continue
+        rho = float(math.hypot(p[0], 0.0))
+        ok = resid <= max_residual_px and dist_range[0] <= rho <= dist_range[1]
+        tried.append((round(float(resid), 2), round(rho, 2)))
+        if not ok:
+            continue
+        g, m = colour_strip(frame_lin, params_to_c2w(p), K, can, cols)
+        k, score = register_shift(g, m, ref, ref_m, cols // 2, 0)
+        if best is None or score > best[0]:
+            best = (score, k, p, resid)
+    info = {"candidates": len(pairs), "fits(px,m)": tried}
+    if best is None:
+        info["reason"] = "no outline fits"
+        return None, info
+    score, k, p, resid = best
+    az = k * 360.0 / cols
+    info.update(outline_px=round(float(resid), 2), azimuth_deg=round(float(az), 2), label_match=round(float(score), 3),
+                camera_height_m=round(float(p[1]), 3), camera_dist_m=round(float(p[0]), 3))
+    # g(s) = ref(s + az): the camera sits at +az in the can frame
+    return rot_z(math.radians(az)) @ params_to_c2w(p), info

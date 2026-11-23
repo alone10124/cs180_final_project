@@ -1,0 +1,8 @@
+# The board as printed for data/real_world_test.mp4: the printer scaled the 300 dpi PNG by
+# about 22/21 (an ArUco marker measured about 2.2 cm without its white margin, designed 2.1 cm),
+# so every length of configs/board.yaml is scaled by 22/21.
+squares: [9, 6]          # squares along x, y
+square_length: 0.029333  # m (0.028 * 22/21)
+marker_length: 0.022     # m, measured
+dictionary: DICT_5X5_100
+can_centre: [0.132, 0.088]   # m (0.126, 0.084 scaled)

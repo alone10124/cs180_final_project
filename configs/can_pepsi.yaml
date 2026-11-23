@@ -1,0 +1,21 @@
+# Diet Pepsi, 12 oz (355 ml) US can. Same fields as can.yaml.
+# Measured on the can used in the real photos (2026-11-22): wall circumference 21 cm
+# (radius 21 / 2 pi = 3.34 cm), straight wall 9.8-10 cm tall, 12 cm in total.
+radius: 0.0334           # m, wall circumference 0.21 m / (2 pi)
+height: 0.1200           # m, base to rim
+usable_z: [0.0110, 0.1050] # m, the 9.9 cm straight wall less ~1 mm at each end (skips the base dome and the neck taper)
+# Used only when posing without a board (capture/pose_silhouette.py): radius of the top rim and of the
+# foot where the can meets the table. Unset = radius (a straight cylinder, as in the simulator).
+# A 12 oz can is about 0.027 and 0.025.
+rim_radius: 0.0270       # 54 mm lid ('202' end)
+base_radius: 0.0250
+
+material:
+  model: coated          # mirror (Fresnel = 1) | coated (clear coat over ink) | metal (bare aluminium, chrome tube)
+  ior: 1.5               # clear-coat refractive index, used by model: coated
+  f0: 0.9                # reflectance at normal incidence, used by model: metal
+
+# Surface-space atlas (angle around the can x height) used for label removal and the dent map.
+atlas: [192, 512]        # rows (height), columns (angle)
+
+min_cos: 0.15            # drop samples whose incidence cosine is below this (grazing edge of the silhouette)

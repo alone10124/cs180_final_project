@@ -14,6 +14,20 @@ class PoseResult:
     reproj_px: float       # RMS reprojection error
 
 
+def make_detector(board):
+    """ChArUco detector tuned for printed boards filmed on a phone: full error correction,
+    a wider margin ignored inside each bit cell (toner bleed and blur), and a wider range
+    of thresholding windows. On a real 4K sweep this raised the frames with a usable board
+    from 17 of 31 to 23 of 31 and the median corners from 6 to 17."""
+    p = cv2.aruco.DetectorParameters()
+    p.errorCorrectionRate = 1.0
+    p.perspectiveRemoveIgnoredMarginPerCell = 0.3
+    p.perspectiveRemovePixelPerCell = 8
+    p.adaptiveThreshWinSizeMin, p.adaptiveThreshWinSizeMax, p.adaptiveThreshWinSizeStep = 5, 63, 6
+    p.minOtsuStdDev = 2.0
+    return cv2.aruco.CharucoDetector(board, cv2.aruco.CharucoParameters(), p)
+
+
 def detect(detector, gray):
     corners, ids, _, _ = detector.detectBoard(gray)
     return corners, ids
@@ -21,7 +35,7 @@ def detect(detector, gray):
 
 def estimate_pose(gray, K, dist, board, cfg, detector=None, min_corners=6):
     """Pose of one greyscale uint8 frame. K is a 3x3 array."""
-    detector = detector or cv2.aruco.CharucoDetector(board)
+    detector = detector or make_detector(board)
     corners, ids = detect(detector, gray)
     if ids is None or len(ids) < min_corners:
         return PoseResult(None, 0 if ids is None else len(ids), float("nan"))
@@ -45,7 +59,7 @@ def estimate_pose(gray, K, dist, board, cfg, detector=None, min_corners=6):
 
 def estimate_poses(frames_rgb, K, dist, board, cfg, max_reproj_px=2.0, min_corners=6):
     """Poses for a list of RGB uint8 frames. Frames without a reliable pose get c2w None."""
-    detector = cv2.aruco.CharucoDetector(board)
+    detector = make_detector(board)
     out = []
     for f in frames_rgb:
         gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)

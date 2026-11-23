@@ -93,7 +93,9 @@ Findings worth knowing:
 - **The table is in the reflection.** Cycles renders the table the can stands on, so every reflection pointing below the horizon shows that table, not the room's floor. The fast renderer treats the room as infinitely far away and shows the floor there instead. This is the largest gap between the two renderers: they agree at 9.7–16 dB over the whole panorama, against 15–22 dB above the horizon. A real can on a table behaves like Cycles, so the simulator should trace the table in its reflections before the next large training run.
 - **Blender cylinders need open walls.** When the caps share the wall's vertices, smooth shading bends the wall's normals like a barrel, and a window reflects as a dot instead of a streak. `sim/blender_scene.py` now builds an open tube with a separate lid.
 
-Not done: the day-1 window photo, real captures, phone calibration, and the Bag of Chips dataset comparison through this pipeline.
+- **Bag of Chips data through this pipeline** (`scripts/run_bagofchips.py`, outputs in `runs/bagofchips/`). The paper's Cans scene has a Pepsi and a Diet Coke **lying on their sides** on a rug, so each can's axis is fitted to the scanned mesh (radius 31 mm, length 125–126 mm, within 4° of horizontal; the outlines sit on the cans in `outline_check.png`) and the poses are re-expressed in each can's frame; the pipeline itself is unchanged. Each can covers 63–64 % of the sphere (a lying can sees the ceiling and both sides, not along its axis), 66 % together, and the two cans put the bright light sources in the same directions. The panorama is blurry and keeps red and blue label residue: real room light makes the printed label's brightness change with the view, which the label model (a fixed label under even light) does not allow. The scene has no true room panorama, so there is no PSNR, and the paper's own method (root folder, `BASELINE.md`) was stopped after 5 of 40 training epochs and never scored, so the paper's numbers have not been reproduced.
+
+Not done: the day-1 window photo, real captures, phone calibration. The Bag of Chips comparison is partly done: see below.
 
 ## Repository layout
 
