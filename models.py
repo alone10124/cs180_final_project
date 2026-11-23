@@ -114,8 +114,11 @@ class SRMModel(nn.Module):
 
     def forward(self, batch, diffuse_linear, diffuse_display):
         weights = self.material(diffuse_display)
-        residual = self.refine(diffuse_display) if self.refine is not None else 0
-        diffuse = (diffuse_linear + residual).clamp(min=0) * batch["mask"]
+        # Main paper Sec. 3.2 defines D'_P = u_phi(D_P): the refinement
+        # network predicts the refined diffuse image directly, not an additive
+        # correction to D_P.
+        diffuse = self.refine(diffuse_display) if self.refine is not None else diffuse_linear
+        diffuse = diffuse.clamp(min=0) * batch["mask"]
         specular = (weights[:, :, None] * self.lookup(batch["refl"])).sum(dim=1)
         specular = specular * batch["vis"] * batch["mask"]
         if "spec_mask" in batch:

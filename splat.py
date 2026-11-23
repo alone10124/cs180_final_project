@@ -17,6 +17,8 @@ from envmap import accumulate, compare, finalize, load_reference, save_png, side
 
 def reconstruct(scene, cans="both", views=0, view_select="fps", diffuse="texture", keep=1.0, seed=0):
     """Returns (pano, valid, frames used)."""
+    if cans == "all":
+        scene.cans = None
     centre = np.load(CACHE / "split.npz")["centre"]
     frames = select_views(load_poses(), centre, scene.train, views, view_select, seed)
     pano, valid = finalize(*accumulate(scene, frames, cans, diffuse, keep, seed))

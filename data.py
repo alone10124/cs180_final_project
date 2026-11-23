@@ -25,10 +25,20 @@ def can_ids(pos, mask, cans, margin=1.2):
     ids = torch.zeros_like(mask)
     if cans is None:
         return ids
-    z = pos[:, 2:3]
-    for k, (x, y, radius, height) in enumerate(cans):
-        near = torch.hypot(pos[:, 0:1] - x, pos[:, 1:2] - y) < radius * margin
-        ids = torch.where(near & (z > CAN_Z_MIN) & (z < height * margin), float(k + 1), ids)
+    if isinstance(cans, list) and cans and isinstance(cans[0], dict):
+        for k, can in enumerate(cans):
+            centre = torch.tensor(can["center"], device=pos.device, dtype=pos.dtype)[None, :, None, None]
+            axis = torch.tensor(can["axis"], device=pos.device, dtype=pos.dtype)[None, :, None, None]
+            delta = pos - centre
+            axial = (delta * axis).sum(1, keepdim=True)
+            radial_sq = ((delta * delta).sum(1, keepdim=True) - axial.square()).clamp(min=0)
+            near = (axial.abs() < can["half_length"] * margin) & (radial_sq < (can["radius"] * margin) ** 2)
+            ids = torch.where(near, float(k + 1), ids)
+    else:
+        z = pos[:, 2:3]
+        for k, (x, y, radius, height) in enumerate(cans):
+            near = torch.hypot(pos[:, 0:1] - x, pos[:, 1:2] - y) < radius * margin
+            ids = torch.where(near & (z > CAN_Z_MIN) & (z < height * margin), float(k + 1), ids)
     return ids * mask
 
 
@@ -47,7 +57,7 @@ class Scene:
         self.arrays = {n: np.load(CACHE / f"{n}.npy", mmap_mode="r") for n in names}
         self.arrays["diffuse"] = np.load(CACHE / f"{diffuse}.npy", mmap_mode="r")
         cans = load_cans()
-        self.cans = None if cans is None else cans.tolist()
+        self.cans = None if cans is None else (cans if isinstance(cans, list) else cans.tolist())
         split = np.load(CACHE / "split.npz")
         self.train, self.test, self.test_angle = split["train"], split["test"], split["angle"]
         self.poses = torch.tensor(load_poses(), dtype=torch.float32, device=device)

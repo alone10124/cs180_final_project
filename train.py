@@ -31,18 +31,15 @@ from models import (
     masked_l1,
 )
 
-# Eq. 6 and 7. The paper does not state its intensity range; L1-type terms are
-# expressed for 0-255 images, which keeps them comparable to the perceptual loss.
-PIXEL_SCALE = 255
-LAMBDA_1 = 0.01 * PIXEL_SCALE
+# Main paper Eqs. 6 and 7: use the published coefficients directly.
+LAMBDA_1 = 0.01
 LAMBDA_P = 1.0
 LAMBDA_G = 0.05
-LAMBDA_S = 1e-4 * PIXEL_SCALE
-LAMBDA_V = 1e-4 * PIXEL_SCALE
-LAMBDA_T = 1e-4 * PIXEL_SCALE
+LAMBDA_S = 1e-4
+LAMBDA_V = 1e-4
+LAMBDA_T = 1e-4
 LR_NET = 2e-4
 LR_SRM = 1e-3
-BETAS = (0.5, 0.999)  # pix2pix default; the paper only says ADAM
 
 
 def amp(device):
@@ -99,9 +96,10 @@ def train_srm(args, scene, device):
     net_params = list(model.material.parameters())
     if model.refine is not None:
         net_params += list(model.refine.parameters())
-    opt_nets = torch.optim.Adam(net_params, LR_NET, betas=BETAS)
+    # The supplement specifies PyTorch Adam, but no non-default betas.
+    opt_nets = torch.optim.Adam(net_params, LR_NET)
     opt_srm = torch.optim.Adam([model.srm], args.lr_srm)
-    opt_disc = torch.optim.Adam(disc.parameters(), LR_NET, betas=BETAS) if disc else None
+    opt_disc = torch.optim.Adam(disc.parameters(), LR_NET) if disc else None
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
     start = 0
     if args.resume and (out / "last.pt").exists():
@@ -204,8 +202,8 @@ def train_renderer(args, scene, device):
     generator = EncoderDecoder(13).to(device)
     disc = Discriminator().to(device)
     perceptual = Perceptual().to(device)
-    opt_g = torch.optim.Adam(generator.parameters(), LR_NET, betas=BETAS)
-    opt_d = torch.optim.Adam(disc.parameters(), LR_NET, betas=BETAS)
+    opt_g = torch.optim.Adam(generator.parameters(), LR_NET)
+    opt_d = torch.optim.Adam(disc.parameters(), LR_NET)
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
     start = 0
     if args.resume and (out / "last.pt").exists():
@@ -304,6 +302,8 @@ def main():
     torch.manual_seed(args.seed)
     device = pick_device()
     scene = Scene(device, diffuse=args.diffuse)
+    if args.cans == "all":
+        scene.cans = None
     if args.views:
         centre = np.load(CACHE / "split.npz")["centre"]
         scene.train = select_views(load_poses(), centre, scene.train, args.views, args.view_select, args.seed)

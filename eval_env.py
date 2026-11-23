@@ -20,6 +20,8 @@ from train import load_srm
 def evaluate_run(scene, run, reference, align=False):
     """Returns (metrics, pano, valid, estimate_display, reference_display)."""
     saved = json.loads((RUNS / run / "args.json").read_text())
+    if saved["cans"] == "all":
+        scene.cans = None
     model = load_srm(scene.device, name=run)
     centre = np.load(CACHE / "split.npz")["centre"]
     frames = select_views(load_poses(), centre, scene.train, saved["views"], saved["view_select"], saved["seed"])
@@ -35,6 +37,11 @@ def main():
     ap.add_argument("--run", default="srm")
     ap.add_argument("--reference", default=None)
     ap.add_argument("--align", action="store_true")
+    ap.add_argument(
+        "--paper-figure",
+        action="store_true",
+        help="also save the raw exposure-normalized SRM as the 500x175 crop used in supplementary Fig. 13",
+    )
     args = ap.parse_args()
 
     scene = Scene(pick_device())
@@ -44,6 +51,10 @@ def main():
     np.save(out / "pano.npy", pano)
     np.save(out / "valid.npy", valid)
     save_png(out / "pano.png", side_by_side(estimate, reference, valid))
+    if args.paper_figure:
+        # The paper's Cans panels are native 500x175 crops and do not overlay
+        # unobserved texels in blue.  This changes presentation only, not data.
+        save_png(out / "pano_paper.png", estimate[:175])
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
     print(json.dumps(metrics, indent=2))
 

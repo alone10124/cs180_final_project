@@ -51,7 +51,7 @@ def save_poses(path, poses):
 
 
 def load_cans():
-    """(K, 4) array of x, y, radius, height per can, or None if the scene has none on record.
+    """Can definitions in legacy vertical or oriented-cylinder format.
 
     Can k (0-based row) has id k + 1 in the per-pixel can buffer; "a" is id 1, "b" is id 2.
     """
@@ -61,6 +61,8 @@ def load_cans():
         rows = json.loads((CACHE / "cans.json").read_text())
     else:
         return None
+    if rows and "center" in rows[0]:
+        return rows
     return np.array([[c["x"], c["y"], c["radius"], c["height"]] for c in rows], np.float32)
 
 
