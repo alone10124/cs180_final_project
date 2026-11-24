@@ -335,8 +335,88 @@ def resect_camera(mb, x, i, target_mask, seed=0, max_az_deg=90.0):
     return cam(q), before, after
 
 
+def resect_block(mb, x, idx, targets, seed=0, max_rot_deg=60.0, max_shift=0.6):
+    """Several consecutive cameras SfM put off together (a run of photos registered as a group
+    in the wrong place) moved as one: a single rotation about the upright can's centre and a
+    shift, shared by all of them, fitted to their silhouettes. Their positions relative to each
+    other (which SfM gets right within the group) are kept. Returns (c2w list, iou before, after)."""
+    poses, s = mb.poses(x)
+    world = mb.world(poses, s)
+    b0, R0, _ = mb.start(x)
+    piv = b0 + s * R0[:, 2] * mb.can.height / 2
+    M0 = [mb.c2w[i].copy() for i in idx]
+
+    def cams(p):
+        Rt = Rotation.from_rotvec(p[:3]).as_matrix()
+        out = []
+        for M in M0:
+            N = M.copy()
+            N[:3, :3] = Rt @ M[:3, :3]
+            N[:3, 3] = piv + Rt @ (M[:3, 3] - piv) + np.asarray(p[3:]) * mb.dist
+            out.append(N)
+        return out
+
+    def ious(p):
+        v = []
+        for M, t in zip(cams(p), targets):
+            r = mb.render_one(world, M, s)
+            v.append((r & t).sum() / max(1, (r | t).sum()))
+        return np.array(v)
+
+    def cost(p):
+        return 1.0 - float(ious(p).mean())
+
+    t, d = math.radians(max_rot_deg), max_shift
+    bnds = [(-t, t)] * 3 + [(-d, d)] * 3
+    before = ious(np.zeros(6))
+    res = differential_evolution(cost, bnds, popsize=15, maxiter=100, tol=1e-6, polish=False, **_rng_kw(seed))
+    q = minimize(cost, res.x, method="Nelder-Mead", bounds=bnds, options={"xatol": 1e-6, "fatol": 1e-6, "maxfev": 800}).x
+    after = ious(q)
+    if after.mean() <= before.mean():
+        return M0, before, before
+    return cams(q), before, after
+
+
+def _redetect(mb, x, have, masks, redetect, log):
+    """Cans the detector missed: where a fitted can shows in a view but no mask covers half of
+    it, SAM is asked for the can in that can's box; kept if it lies inside the fitted can.
+    Updates mb.masks; returns how many were added."""
+    H0, W0 = np.asarray(masks[0]).shape
+    hb, wb = mb.masks.shape[1:]
+    fx, fy = W0 / wb, H0 / hb
+    poses, s_ = mb.poses(x)
+    world = mb.world(poses, s_)
+    added = 0
+    for i in range(len(mb.c2w)):
+        each = mb.render_one(world, mb.c2w[i], s_, each=True)
+        boxes, which = [], []
+        for k, rk in enumerate(each):
+            a = rk.sum()
+            if a < 50 or (rk & mb.masks[i]).sum() >= 0.5 * a:
+                continue
+            ys, xs = np.nonzero(rk)
+            boxes.append([xs.min() * fx, ys.min() * fy, (xs.max() + 1) * fx, (ys.max() + 1) * fy])
+            which.append(k)
+        if not boxes:
+            continue
+        try:
+            got = redetect(int(np.flatnonzero(have)[i]), np.array(boxes))
+        except Exception as e:  # noqa: BLE001
+            log(f"mask fit: re-detection failed in view {i} ({e!r})")
+            continue
+        for m, k in zip(got, which):
+            m = cv2.resize(m.astype(np.float32), (wb, hb), interpolation=cv2.INTER_AREA) >= 0.5
+            rk = each[k]
+            if m.sum() >= 0.3 * rk.sum() and (m & rk).sum() >= 0.6 * m.sum():
+                mb.masks[i] |= m
+                added += 1
+    mb.area = mb.masks.reshape(len(mb.masks), -1).sum(1)
+    return added
+
+
 def fit_masks(masks, c2w, K, can, n_lying, cams_up, log=print, long_side=320, seed=0, workers=1, maxiter=400, popsize=25,
-              instances=None, trim=0.15, refine_below=0.75, min_gain=0.05, resect_below=0.6, redetect=None):
+              instances=None, trim=0.15, refine_below=0.75, min_gain=0.05, resect_below=0.4,
+              block_min=3, redetect=None):
     """masks: per view HxW bool union masks of the cans, at the size K describes; instances:
     optional per view (N, H, W) masks of each detected can (for dropping the ones the scene
     does not explain); redetect: optional f(view index, boxes (N, 4) in mask pixels) -> (N, H, W)
@@ -387,9 +467,49 @@ def fit_masks(masks, c2w, K, can, n_lying, cams_up, log=print, long_side=320, se
             x_rep, pop = _search(ms, bnds, seed + 1, workers, max(60, maxiter // 3), popsize, log, init=init, tag=" (cleaned masks)")
             x = _polish(mb, bnds, np.vstack([x[None], x_rep[None], pop]), log, tag=" (cleaned masks)")
 
+    # 2b. cans the detector missed (a shiny can, or one partly hidden): found with SAM at the
+    # fitted cans' boxes BEFORE any camera is judged, so a view is not taken for badly placed
+    # just because one of its cans has no mask
+    redetected = 0
+    if redetect is not None:
+        redetected = _redetect(mb, x, have, masks, redetect, log)
+        log(f"mask fit: {redetected} cans the detector missed found again by SAM (SfM cameras)")
+        raw_b = raw_b | mb.masks
+        if redetected:
+            x = _polish(mb, bnds, x[None], log, n=1, tag=" (re-detected cans)")
+
     # 3a. views fitted very badly: SfM put the camera far off (chrome and reflections can
-    # register a photo in the wrong place). Placed again from the cans' silhouettes, against
-    # the view's masks before cleaning, then that view's masks cleaned with its new camera
+    # register a photo in the wrong place). A run of consecutive such views is moved as one
+    # block first (their relative placement is kept), then each still-bad view is placed again
+    # from the cans' silhouettes, against the view's masks before cleaning, and that view's
+    # masks cleaned with its new camera
+    iou = mb.iou(x)
+    bad = np.flatnonzero(iou < resect_below)
+    blocks = []
+    run = []
+    for i in bad:
+        if run and i != run[-1] + 1:
+            blocks.append(run)
+            run = []
+        run.append(int(i))
+    if run:
+        blocks.append(run)
+    moved_blocks = []
+    for blk in blocks:
+        if len(blk) < block_min:
+            continue
+        Ms, a, b_ = resect_block(mb, x, blk, [raw_b[i] for i in blk], seed=seed)
+        if b_.mean() >= a.mean() + min_gain:
+            for i, M in zip(blk, Ms):
+                mb.c2w[i] = M
+                mb.masks[i] = raw_b[i]
+            moved_blocks.append({"views": [int(np.flatnonzero(have)[i]) for i in blk],
+                                 "iou_raw_masks": [round(float(a.mean()), 3), round(float(b_.mean()), 3)]})
+    mb.area = mb.masks.reshape(len(mb.masks), -1).sum(1)
+    log(f"mask fit: blocks of cameras moved together: {moved_blocks}")
+    info["camera_blocks_moved"] = moved_blocks
+    if moved_blocks:
+        x = _polish(mb, bnds, x[None], log, n=1, tag=" (moved camera blocks)")
     iou = mb.iou(x)
     resected = []
     for i in np.flatnonzero(iou < resect_below):
@@ -425,41 +545,12 @@ def fit_masks(masks, c2w, K, can, n_lying, cams_up, log=print, long_side=320, se
     log(f"mask fit: cameras refined against their masks: {refined}")
     if refined:
         x = _polish(mb, bnds, x[None], log, n=1, tag=" (refined cameras)")
-    # 4. cans the detector missed: where a fitted can shows in a view but no mask covers it,
-    # SAM is asked for the can in that can's box; kept if it lies inside the fitted can
-    redetected = 0
+    # 4. a second look for missed cans, with the cameras moved and refined
     if redetect is not None:
-        H0, W0 = np.asarray(masks[0]).shape
-        hb, wb = mb.masks.shape[1:]
-        fx, fy = W0 / wb, H0 / hb
-        poses, s_ = mb.poses(x)
-        world = mb.world(poses, s_)
-        for i in range(len(mb.c2w)):
-            each = mb.render_one(world, mb.c2w[i], s_, each=True)
-            boxes, which = [], []
-            for k, rk in enumerate(each):
-                a = rk.sum()
-                if a < 50 or (rk & mb.masks[i]).sum() >= 0.5 * a:
-                    continue
-                ys, xs = np.nonzero(rk)
-                boxes.append([xs.min() * fx, ys.min() * fy, (xs.max() + 1) * fx, (ys.max() + 1) * fy])
-                which.append(k)
-            if not boxes:
-                continue
-            try:
-                got = redetect(int(np.flatnonzero(have)[i]), np.array(boxes))
-            except Exception as e:  # noqa: BLE001
-                log(f"mask fit: re-detection failed in view {i} ({e!r})")
-                continue
-            for m, k in zip(got, which):
-                m = cv2.resize(m.astype(np.float32), (wb, hb), interpolation=cv2.INTER_AREA) >= 0.5
-                rk = each[k]
-                if m.sum() >= 0.3 * rk.sum() and (m & rk).sum() >= 0.6 * m.sum():
-                    mb.masks[i] |= m
-                    redetected += 1
-        mb.area = mb.masks.reshape(len(mb.masks), -1).sum(1)
-        log(f"mask fit: {redetected} cans the detector missed found again by SAM at the fitted cans' boxes")
-        if redetected:
+        more = _redetect(mb, x, have, masks, redetect, log)
+        log(f"mask fit: {more} more missed cans found after the cameras moved")
+        redetected += more
+        if more:
             x = _polish(mb, bnds, x[None], log, n=1, tag=" (re-detected cans)")
     info["cans_redetected"] = redetected
     iou = mb.iou(x)

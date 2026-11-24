@@ -132,6 +132,8 @@ def main():
     ap.add_argument("--label-atlas", nargs="+", default=None,
                     help="label_atlas.npy files (label_from_video.py, label_from_render.py): per can, the one that matches "
                          "the scene's own label estimate best is used instead of that estimate")
+    ap.add_argument("--label-prefer-margin", type=float, default=0.08,
+                    help="with several --label-atlas: a later atlas replaces the first only if it correlates better by this")
     ap.add_argument("--label-min-corr", type=float, default=0.3, help="use the video label only if it correlates at least this well")
     ap.add_argument("--keep-can-reflections", action="store_true",
                     help="keep pixels where a can mirrors another can (default: left out of label and room)")
@@ -337,12 +339,13 @@ def main():
 
     c2w_cans = [torch.tensor(c["c2w"], dtype=torch.float32, device=device) for c in cans]
     checks = []
-    for j in np.linspace(0, len(rgb) - 1, min(9, len(rgb))).astype(int):
+    for j in range(len(rgb)):  # every photo: the fitted cans' silhouettes
         img = rgb[j]
         for k, cw in enumerate(c2w_cans):
-            img = debug.can_outline(img, cw[j], K, can, COLOURS[k % len(COLOURS)])
-        checks.append(img)
-    debug.save_rgb(out / "01_cans.png", debug.montage(checks, cols=3))
+            img = debug.can_silhouette(img, cw[j], K, can, COLOURS[k % len(COLOURS)])
+        cv2.putText(img, str(j), (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 3, (255, 0, 0), 6)
+        checks.append(cv2.resize(img, (ww // 2, hh // 2), interpolation=cv2.INTER_AREA))
+    debug.save_rgb(out / "01_cans.png", debug.montage(checks, cols=6))
 
     # 5. per-can reconstruction, turned into the world frame (axes of the upright can)
     frames = linearize(torch.from_numpy(np.stack(rgb)).permute(0, 3, 1, 2).float().div(255), "srgb").to(device)
@@ -352,11 +355,15 @@ def main():
 
     def fit_any(est, count, rows):
         """The atlas (of those given) that matches this estimate best, fitted to it."""
+        # the first atlas is preferred (the cleanest one, e.g. unwrapped from a render); another
+        # is used only if it matches clearly better, since a smeared atlas (a doubled logo) can
+        # correlate a little better with an estimate that is itself smeared
         best = (None, {"correlation": -1.0})
         for j, a in enumerate(atlases):
             f, inf = fit_label_atlas(a, est, count, rows=rows)
             inf["atlas"] = Path(args.label_atlas[j]).parent.name
-            if inf.get("correlation", -1.0) > best[1].get("correlation", -1.0):
+            margin = 0.0 if j == 0 or best[0] is None else args.label_prefer_margin
+            if inf.get("correlation", -1.0) > best[1].get("correlation", -1.0) + margin:
                 best = (f, inf)
         return best
     H, W = args.pano

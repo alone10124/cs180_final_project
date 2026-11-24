@@ -81,6 +81,28 @@ def can_outline(frame_rgb, c2w, K, can, colour=(0, 255, 0)):
     return img
 
 
+def can_silhouette(frame_rgb, c2w, K, can, colour=(0, 255, 0)):
+    """Draw the projected can as a whole: its silhouette (convex hull of rim and base, lightly
+    tinted, outlined) and the rim, so a misplaced can is obvious at a glance."""
+    img = frame_rgb.copy()
+    s = torch.linspace(-math.pi, math.pi, 97, device=c2w.device)[:-1]
+    pts, ok = [], True
+    for z in (0.0, can.height):
+        p = cylinder.surface_point(s, torch.full_like(s, z), can.radius)
+        uv, depth = project(p[None], c2w[None], K)
+        ok &= bool((depth > 0).all())
+        pts.append(uv[0].cpu().numpy())
+    if not ok:
+        return img
+    hull = cv2.convexHull(np.vstack(pts).astype(np.float32)).astype(np.int32)
+    tint = img.copy()
+    cv2.fillConvexPoly(tint, hull, colour)
+    img = cv2.addWeighted(img, 0.75, tint, 0.25, 0)
+    cv2.polylines(img, [hull], True, colour, 3, cv2.LINE_AA)
+    cv2.polylines(img, [pts[1].astype(np.int32)], True, colour, 2, cv2.LINE_AA)  # the top rim
+    return img
+
+
 def direction_rgb(dirs, mask):
     """Unit directions (H, W, 3) shown as RGB = (d + 1) / 2, black outside mask."""
     img = ((dirs.detach().cpu().numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
