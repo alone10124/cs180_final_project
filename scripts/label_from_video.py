@@ -141,7 +141,10 @@ def main():
     ap.add_argument("--percentile", type=float, default=25.0)
     ap.add_argument("--turns", type=int, default=1, help="whole turns the can makes between the first frame and the closing one")
     ap.add_argument("--smooth", type=float, default=0.3, help="weight of the steady-speed prior (per frame, in columns)")
-    ap.add_argument("--refine-iters", type=int, default=2, help="passes re-aligning every frame against the mosaic")
+    ap.add_argument("--refine-iters", type=int, default=4, help="passes re-aligning every frame against the mosaic")
+    ap.add_argument("--refine-search", type=int, default=20, help="columns either way a frame may move per pass")
+    ap.add_argument("--turn-scale", type=float, nargs=2, default=[0.85, 1.4], help="range searched for the turn's total length (x the matched one)")
+    ap.add_argument("--turn-scale-search", action="store_true", help="search the turn's length even when the turn was closed")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -231,49 +234,95 @@ def main():
         info.update(closure_frame=int(turn[1]), closure_matches=int(turn[0]), turns=args.turns,
                     closure_residual_columns=round(float(phi[turn[1]] - (sign * args.turns * cols + turn[2])), 2))
 
-    # 5. every frame re-aligned against the mosaic of the others
+    # 5. every frame re-aligned against the mosaic of all the OTHER frames (its own
+    # reflections, fixed to the view, would otherwise pull it to where it already is), on the
+    # print's edges and its colour (the logo's red and blue). First the turn's total length:
+    # the angles scaled until the frames agree best (SIFT misses fast turns, so the chain
+    # comes out short), then each frame within +-search columns, smoothed by the same
+    # steady-speed prior.
     j0 = cols // 2 - len(thetas) // 2  # frame 0's front faces angle 0 (column cols/2)
     face = np.cos(thetas) > math.cos(math.radians(args.theta_max - 5))
     jf = np.nonzero(face)[0]
     rlo = int(args.match_rows * rows)
 
-    def hp(g):
-        return g - cv2.blur(g, (9, 9))
+    def feats(st):
+        f = st[rlo:, jf].astype(np.float32) / 255
+        g = cv2.cvtColor(st, cv2.COLOR_BGR2GRAY).astype(np.float32)[rlo:, jf] / 255
+        g = g - cv2.blur(g, (9, 9))
+        sm = f.sum(2) + 0.1 * f.sum(2).mean() + 1e-4
+        ch = [(f[..., 2] - f[..., 1]) / sm, (f[..., 0] - f[..., 1]) / sm]  # BGR: r - g, b - g
+        out = np.stack([g] + ch)
+        out = out - out.mean((1, 2), keepdims=True)
+        return out / (out.std((1, 2), keepdims=True) + 1e-6)
 
-    gstrips = [hp(cv2.cvtColor(st, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255)[rlo:] for st in strips]
-    moves = []
-    for it in range(args.refine_iters):
-        acc = np.zeros((rows - rlo, cols), np.float32)
+    F_ = np.stack([feats(st) for st in strips])  # (n, 3, rows', len(jf))
+
+    def mosaic(ph):
+        acc = np.zeros(F_.shape[1:3] + (cols,), np.float32)
         cnt = np.zeros(cols, np.float32)
-        for i_, g_ in enumerate(gstrips):
-            c_ = (np.round(j0 + jf + phi[i_]).astype(int)) % cols
-            np.add.at(acc.T, c_, g_[:, jf].T)
-            np.add.at(cnt, c_, 1)
-        mosaic = acc / np.maximum(cnt, 1)[None]
-        meas = np.zeros(n)
+        cs = (np.round(j0 + jf[None] + ph[:, None]).astype(int)) % cols
+        for i_ in range(n):
+            np.add.at(acc.transpose(2, 0, 1), cs[i_], F_[i_].transpose(2, 0, 1))
+            np.add.at(cnt, cs[i_], 1)
+        return acc, cnt, cs
+
+    def corr_with_others(i_, acc, cnt, cs, ph_i):
+        """Correlation of frame i with the mosaic of the others, frame placed at ph_i."""
+        own = np.zeros_like(acc)
+        own_c = np.zeros(cols, np.float32)
+        np.add.at(own.transpose(2, 0, 1), cs[i_], F_[i_].transpose(2, 0, 1))
+        np.add.at(own_c, cs[i_], 1)
+        c_ = (np.round(j0 + jf + ph_i).astype(int)) % cols
+        cnt_o = (cnt - own_c)[c_]
+        ok = cnt_o > 0
+        if ok.sum() < 0.3 * len(jf):
+            return None
+        mo = ((acc - own)[..., c_] / np.maximum(cnt_o, 1))[..., ok]
+        a_ = F_[i_][..., ok]
+        a_, mo = a_ - a_.mean(), mo - mo.mean()
+        return float((a_ * mo).sum() / (np.linalg.norm(a_) * np.linalg.norm(mo) + 1e-9))
+
+    def agreement(ph):
+        acc, cnt, cs = mosaic(ph)
+        v = [corr_with_others(i_, acc, cnt, cs, ph[i_]) for i_ in range(0, n, 2)]
+        v = [x for x in v if x is not None]
+        return float(np.mean(v)) if v else -1.0
+
+    if turn is None or args.turn_scale_search:
+        scales = np.linspace(args.turn_scale[0], args.turn_scale[1], 31)
+        sc_scores = [agreement(phi * k) for k in scales]
+        kbest = float(scales[int(np.argmax(sc_scores))])
+        phi = phi * kbest
+        info["turn_scale"] = round(kbest, 3)
+        info["turn_deg_scaled"] = round(float(phi[-1] * dth * 180 / math.pi), 1)
+        info["turn_scale_agreement"] = [round(min(sc_scores), 3), round(max(sc_scores), 3)]
+    moves, agree = [], [round(agreement(phi), 3)]
+    for it in range(args.refine_iters):
+        acc, cnt, cs = mosaic(phi)
+        meas = phi.copy()
         conf = np.zeros(n)
-        for i_, g_ in enumerate(gstrips):
+        for i_ in range(n):
             best = (-2.0, 0)
-            for d in range(-12, 13):
-                c_ = (np.round(j0 + jf + phi[i_] + d).astype(int)) % cols
-                a_, b_ = g_[:, jf].ravel(), mosaic[:, c_].ravel()
-                cc = float(np.dot(a_ - a_.mean(), b_ - b_.mean()) / (np.linalg.norm(a_ - a_.mean()) * np.linalg.norm(b_ - b_.mean()) + 1e-9))
-                if cc > best[0]:
-                    best = (cc, d)
+            for d in range(-args.refine_search, args.refine_search + 1):
+                c = corr_with_others(i_, acc, cnt, cs, phi[i_] + d)
+                if c is not None and c > best[0]:
+                    best = (c, d)
             meas[i_], conf[i_] = phi[i_] + best[1], max(0.0, best[0])
-        # the re-aligned angles, smoothed by the same steady-speed prior
-        A2 = np.vstack([np.diag(conf * 10 + 1e-3)] + [np.zeros((0, n))])
-        rows_dd = []
+        # the re-aligned angles, smoothed by the same steady-speed prior (phi_0 kept)
+        wv_ = conf * 10 + 1e-3
+        A2 = [np.diag(wv_)]
+        y2 = [meas * wv_]
         for i_ in range(1, n - 1):
             r_ = np.zeros(n)
             r_[i_ - 1], r_[i_], r_[i_ + 1] = args.smooth, -2 * args.smooth, args.smooth
-            rows_dd.append(r_)
-        A2 = np.vstack([A2] + rows_dd)
-        y2 = np.concatenate([meas * (conf * 10 + 1e-3), np.zeros(len(rows_dd))])
-        new = np.linalg.lstsq(A2, y2, rcond=None)[0]
+            A2.append(r_[None]); y2.append([0.0])
+        new = np.linalg.lstsq(np.vstack(A2), np.concatenate(y2), rcond=None)[0]
         moves.append(round(float(np.median(np.abs(new - phi))), 2))
-        phi = new
+        phi = new - new[0]
+        agree.append(round(agreement(phi), 3))
     info["refine_median_move_columns"] = moves
+    info["frame_agreement"] = agree
+    info["turn_deg_final"] = round(float(phi[-1] * dth * 180 / math.pi), 1)
 
     # 6. composite: frame i column j shows the label at atlas column (j0 + j + phi_i)
     stack = [[] for _ in range(cols)]

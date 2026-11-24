@@ -142,3 +142,36 @@ def _detect(images, device, long_side, score, max_cans, log, cv2, nms, oproc, ow
     log(f"can masks: {sum(len(x) for x in boxes_all)} cans in {len(images)} photos "
         f"({', '.join(str(len(x)) for x in boxes_all)}); {dropped_shape} dropped by shape")
     return masks, boxes_all, inst_all
+
+
+def sam_box_prompter(device="cpu", long_side=768, log=print):
+    """A function (image HxWx3 uint8 RGB, boxes (N, 4) in its pixels) -> (N, H, W) bool masks
+    from SAM prompted with those boxes; or None if SAM cannot be loaded. Used to segment a
+    can the detector missed (most often one partly hidden behind another) at the box where
+    the fitted scene says it is."""
+    try:
+        import cv2
+        from transformers import SamModel, SamProcessor
+
+        sproc = SamProcessor.from_pretrained("facebook/sam-vit-base")
+        sam = SamModel.from_pretrained("facebook/sam-vit-base").to(device).eval()
+    except Exception as e:  # noqa: BLE001
+        log(f"can masks: SAM unavailable for prompting ({e})")
+        return None
+
+    def run(image, boxes):
+        h, w = image.shape[:2]
+        f = min(1.0, long_side / max(h, w))
+        small = cv2.resize(image, (round(w * f), round(h * f)), interpolation=cv2.INTER_AREA) if f < 1 else image
+        b = (np.asarray(boxes, float) * f).tolist()
+        with torch.no_grad():
+            sin = sproc(small, input_boxes=[b], return_tensors="pt").to(device)
+            so = sam(**sin, multimask_output=False)
+            pp = getattr(sproc, "post_process_masks", None) or sproc.image_processor.post_process_masks
+            rs = sin.get("reshaped_input_sizes", sin["original_sizes"])
+            m = pp(so.pred_masks.cpu(), sin["original_sizes"].cpu(), rs.cpu())[0][:, 0].numpy().astype(bool)
+        if f < 1:
+            m = np.stack([cv2.resize(x.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool) for x in m])
+        return m
+
+    return run

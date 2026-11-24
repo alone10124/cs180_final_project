@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT))
 
 from sodacan import debug  # noqa: E402
 from sodacan.capture import can_fit  # noqa: E402
-from sodacan.capture.can_masks import detect_can_masks  # noqa: E402
+from sodacan.capture.can_masks import detect_can_masks, sam_box_prompter  # noqa: E402
 from sodacan.capture.group_fit import fit_group  # noqa: E402
 from sodacan.capture.mask_fit import fit_masks, mask_cost  # noqa: E402
 from sodacan.capture.multi_can_fit import fit_cans  # noqa: E402
@@ -129,7 +129,9 @@ def main():
                     help="locate the cans from the SfM points on their labels (auto: outlines if that fails) or outlines only")
     ap.add_argument("--fit-views", type=int, default=12, help="photos used to fit the can outlines")
     ap.add_argument("--no-photographer", action="store_true")
-    ap.add_argument("--label-atlas", default=None, help="label_atlas.npy from label_from_video.py: used instead of the per-scene label estimate")
+    ap.add_argument("--label-atlas", nargs="+", default=None,
+                    help="label_atlas.npy files (label_from_video.py, label_from_render.py): per can, the one that matches "
+                         "the scene's own label estimate best is used instead of that estimate")
     ap.add_argument("--label-min-corr", type=float, default=0.3, help="use the video label only if it correlates at least this well")
     ap.add_argument("--keep-can-reflections", action="store_true",
                     help="keep pixels where a can mirrors another can (default: left out of label and room)")
@@ -197,8 +199,9 @@ def main():
             sm = [cv2.resize(m.astype(np.float32), (round(ww * 400 / max(ww, hh)), round(hh * 400 / max(ww, hh))),
                              interpolation=cv2.INTER_AREA) >= 0.5 for m in masks]
             np.savez_compressed(out / "masks.npz", masks=np.stack(sm))  # 400 px, for checking fits offline
+            prompt = sam_box_prompter(device=device, log=log)
             mf = fit_masks(masks, c2w_sfm, K, can, args.lying, cams_up, log=log, workers=-1 if (os.cpu_count() or 1) > 1 else 1,
-                           instances=det[2])
+                           instances=det[2], redetect=None if prompt is None else (lambda i, boxes, ims=rgb: prompt(ims[i], boxes)))
             if mf is not None:
                 # the masks kept (explained by the fitted scene) and the cameras refined against them
                 msc = mf["scene"]
@@ -344,7 +347,18 @@ def main():
     # 5. per-can reconstruction, turned into the world frame (axes of the upright can)
     frames = linearize(torch.from_numpy(np.stack(rgb)).permute(0, 3, 1, 2).float().div(255), "srgb").to(device)
     del rgb
-    video_label = torch.from_numpy(np.load(args.label_atlas)).float().to(device) if args.label_atlas else None
+    atlases = [torch.from_numpy(np.load(p)).float().to(device) for p in (args.label_atlas or [])]
+    video_label = atlases[0] if atlases else None
+
+    def fit_any(est, count, rows):
+        """The atlas (of those given) that matches this estimate best, fitted to it."""
+        best = (None, {"correlation": -1.0})
+        for j, a in enumerate(atlases):
+            f, inf = fit_label_atlas(a, est, count, rows=rows)
+            inf["atlas"] = Path(args.label_atlas[j]).parent.name
+            if inf.get("correlation", -1.0) > best[1].get("correlation", -1.0):
+                best = (f, inf)
+        return best
     H, W = args.pano
     B = frames.shape[0]
     up_world = R0[:, 2]
@@ -380,9 +394,11 @@ def main():
         if video_label is not None and r.label is not None and c["kind"] == "lying":
             # a lying can's silhouette and outline barely say which end is the lid: its label
             # does. Turned end over end, the can's label estimate is the same one flipped
-            # upside down (and mirrored, which fit_label_atlas tries anyway).
-            _, i1 = fit_label_atlas(video_label, r.label, r.label_count, rows=z_rows)
-            _, i2 = fit_label_atlas(video_label, r.label.flip(1), r.label_count.flip(0), rows=z_rows)
+            # upside down and with its angle reversed (turning it 180 deg about an axis across
+            # it flips the can's own y and z: theta -> -theta).
+            _, i1 = fit_any(r.label, r.label_count, z_rows)
+            _, i2 = fit_any(r.label.flip(1).flip(2), r.label_count.flip(0).flip(1),
+                            (r.label.shape[1] - z_rows[1], r.label.shape[1] - z_rows[0]))
             c1, c2 = i1.get("correlation", -1.0), i2.get("correlation", -1.0)
             flip = c2 > c1 + args.label_flip_margin
             metrics["cans"][k]["end_over_end"] = {"label_corr_as_fitted": round(c1, 3), "label_corr_turned": round(c2, 3),
@@ -399,7 +415,7 @@ def main():
                 label, est = r.label, r.label
         if video_label is not None and r.label is not None:
             # the label from the video, turned and scaled to this scene's own estimate
-            fitted, linfo = fit_label_atlas(video_label, r.label, r.label_count, rows=z_rows)
+            fitted, linfo = fit_any(r.label, r.label_count, z_rows)
             metrics["cans"][k]["video_label"] = linfo
             log(f"can {k}: video label {linfo}")
             if fitted is not None and linfo["correlation"] >= args.label_min_corr:

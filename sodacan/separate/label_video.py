@@ -64,11 +64,14 @@ def _corr_curve(e, m, v):
     return num / (var.sqrt() * e.norm() + 1e-12)
 
 
-def fit_label_atlas(video, est, count, min_count=3, rows=None, scales=None, offsets=None):
+def fit_label_atlas(video, est, count, min_count=3, rows=None, scales=None, offsets=None, allow_mirror=False):
     """video, est (3, Ha, Wa) linear; count (Ha, Wa) views per texel of est.
     rows: optional (lo, hi) atlas rows to compare (e.g. the printed band).
     The video atlas is also stretched and shifted in height (scales, offsets in rows): the
-    video's unwrapped band and the scene's are cut at slightly different heights.
+    video's unwrapped band and the scene's are cut at slightly different heights. Mirroring is
+    off by default: every atlas here is in the pipeline's own handedness (checked: the render,
+    board-video and can_label atlases all match unmirrored), and a free mirror lets a can
+    turned end over end match a mirrored label instead of being turned.
     Returns (label (3, Ha, Wa), info dict)."""
     video = video.to(est.device, est.dtype)
     if video.shape[1:] != est.shape[1:]:
@@ -94,7 +97,7 @@ def fit_label_atlas(video, est, count, min_count=3, rows=None, scales=None, offs
     g = {mirror: (video.flip(-1) if mirror else video) for mirror in (False, True)}
 
     def search(sc_list, of_list, best):
-        for mirror in (False, True):
+        for mirror in ((False, True) if allow_mirror else (False,)):
             for sc in sc_list:
                 for of in of_list:
                     c, k = _best_shift_multi(E, m, _features(_vwarp(g[mirror], sc, of)))

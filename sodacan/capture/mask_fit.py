@@ -262,11 +262,86 @@ def refine_camera(mb, x, i, max_rot_deg=12.0, max_shift=0.2, seed=0):
     return cam(p), 1 - c0, 1 - c1
 
 
+def _look_from(C, target, up, roll):
+    """c2w rotation of a camera at C looking at target, image y pointing down along -up,
+    turned by roll about its optical axis."""
+    z = target - C
+    z = z / np.linalg.norm(z)
+    y = -up - (-up @ z) * z
+    if np.linalg.norm(y) < 1e-6:
+        y = np.cross(z, [1.0, 0, 0])
+    y = y / np.linalg.norm(y)
+    x = np.cross(y, z)
+    c, sn = math.cos(roll), math.sin(roll)
+    x, y = c * x + sn * y, -sn * x + c * y
+    return np.stack([x, y, z], 1)
+
+
+def resect_camera(mb, x, i, target_mask, seed=0, max_az_deg=90.0):
+    """Camera i placed again from the silhouettes of the fitted cans alone (camera resection
+    against a known scene), for a view SfM put far off: where the camera stands around the
+    upright can (azimuth within max_az_deg of SfM's, elevation, distance), the point it looks
+    at and its roll. Returns (c2w, iou before, iou after)."""
+    poses, s = mb.poses(x)
+    world = mb.world(poses, s)
+    b0, R0, _ = mb.start(x)
+    M0 = mb.c2w[i]
+
+    def iou_of(M):
+        r = mb.render_one(world, M, s)
+        return (r & target_mask).sum() / max(1, (r | target_mask).sum())
+
+    # SfM's camera in the upright can's frame (metres): the search is centred on it
+    p = R0.T @ (M0[:3, 3] - b0) / s
+    az0 = math.atan2(p[1], p[0])
+    look = (M0[:3, 2] @ R0)  # optical axis in the can frame
+    centre_h = 0.5 * mb.can.height
+
+    def cam(q):
+        az, el, d, tx, ty, tz, roll = q
+        C = np.array([d * math.cos(el) * math.cos(az), d * math.cos(el) * math.sin(az), centre_h + d * math.sin(el)])
+        T = np.array([tx, ty, centre_h + tz])
+        M = np.eye(4)
+        M[:3, :3] = R0 @ _look_from(C, T, np.array([0.0, 0, 1]), roll)
+        M[:3, 3] = b0 + s * (R0 @ C)
+        return M
+
+    def cost(q):
+        return 1.0 - iou_of(cam(q))
+
+    a = math.radians(max_az_deg)
+    bnds = [(az0 - a, az0 + a), (math.radians(-20), math.radians(70)), (0.08, 0.7),
+            (-0.15, 0.15), (-0.15, 0.15), (-0.08, 0.08), (math.radians(-60), math.radians(60))]
+    # SfM's own camera as one member of the start population
+    r0 = math.hypot(p[0], p[1])
+    el0 = math.atan2(p[2] - centre_h, r0)
+    d0 = float(np.linalg.norm(p - [0, 0, centre_h]))
+    t_hit = max(0.05, -(p - [0, 0, centre_h]) @ look)
+    T0 = p + t_hit * look - [0, 0, centre_h]
+    q0 = np.clip([az0, el0, d0, T0[0], T0[1], T0[2], 0.0], [b[0] for b in bnds], [b[1] for b in bnds])
+    Rl = R0 @ _look_from(p, p + look, np.array([0.0, 0, 1]), 0.0)
+    cz = M0[:3, :3].T @ Rl  # SfM's roll relative to the level camera
+    q0[6] = float(np.clip(-math.atan2(cz[0, 1], cz[0, 0]), bnds[6][0], bnds[6][1]))
+    rng = np.random.default_rng(seed)
+    lo, hi = np.array([b[0] for b in bnds]), np.array([b[1] for b in bnds])
+    init = lo + rng.random((20 * len(bnds), len(bnds))) * (hi - lo)
+    init[0] = q0
+    before = iou_of(M0)
+    res = differential_evolution(cost, bnds, init=init, maxiter=120, tol=1e-6, polish=False, **_rng_kw(seed))
+    q = minimize(cost, res.x, method="Nelder-Mead", bounds=bnds, options={"xatol": 1e-6, "fatol": 1e-6, "maxfev": 800}).x
+    after = 1.0 - cost(q)
+    if after <= before:
+        return M0, before, before
+    return cam(q), before, after
+
+
 def fit_masks(masks, c2w, K, can, n_lying, cams_up, log=print, long_side=320, seed=0, workers=1, maxiter=400, popsize=25,
-              instances=None, trim=0.15, refine_below=0.75, min_gain=0.05):
+              instances=None, trim=0.15, refine_below=0.75, min_gain=0.05, resect_below=0.6, redetect=None):
     """masks: per view HxW bool union masks of the cans, at the size K describes; instances:
     optional per view (N, H, W) masks of each detected can (for dropping the ones the scene
-    does not explain). Returns dict(b0, R0, s, lying (n, 3) [x, y, yaw], info, x, scene,
+    does not explain); redetect: optional f(view index, boxes (N, 4) in mask pixels) -> (N, H, W)
+    masks at the masks' size (SAM prompted with boxes), used where a fitted can has no mask
+    (the detector missed it, mostly when another can hides part of it). Returns dict(b0, R0, s, lying (n, 3) [x, y, yaw], info, x, scene,
     views, c2w (every input camera; those refined against their masks replaced)) or None."""
     small, Ks = small_masks(masks, K, long_side)
     have = small.reshape(len(small), -1).any(1)
@@ -286,11 +361,14 @@ def fit_masks(masks, c2w, K, can, n_lying, cams_up, log=print, long_side=320, se
     mb = MaskScene(can, c2w.copy(), Kb, big[have], n_lying, cams_up, centre, dist, trim=trim)
     x = _polish(mb, bnds, np.vstack([x_rep[None], pop]), log)
     info = {"round1_iou_mean": round(float(mb.iou(x).mean()), 4)}
+    raw_b = mb.masks.copy()  # before any cleaning (the cleaning trusts each view's camera)
+    inst_b = None
 
     # 2. drop the detected masks the scene does not explain; search again from this answer
     if instances is not None:
         inst = [iv for iv, h_ in zip(instances, have) if h_]
         inst_b = [small_masks(iv, K, 2 * long_side)[0] if len(iv) else np.zeros((0,) + mb.masks.shape[1:], bool) for iv in inst]
+        inst_b = list(inst_b)
         new_b, kept, dropped = _consistent(mb, x, inst_b)
         log(f"mask fit: {kept} can masks explained by the fitted scene, {len(dropped)} dropped (views {sorted(set(dropped))})")
         info["masks_dropped"] = len(dropped)
@@ -309,7 +387,34 @@ def fit_masks(masks, c2w, K, can, n_lying, cams_up, log=print, long_side=320, se
             x_rep, pop = _search(ms, bnds, seed + 1, workers, max(60, maxiter // 3), popsize, log, init=init, tag=" (cleaned masks)")
             x = _polish(mb, bnds, np.vstack([x[None], x_rep[None], pop]), log, tag=" (cleaned masks)")
 
-    # 3. the views still fitted badly: their cameras refined against their own masks
+    # 3a. views fitted very badly: SfM put the camera far off (chrome and reflections can
+    # register a photo in the wrong place). Placed again from the cans' silhouettes, against
+    # the view's masks before cleaning, then that view's masks cleaned with its new camera
+    iou = mb.iou(x)
+    resected = []
+    for i in np.flatnonzero(iou < resect_below):
+        M, a, b_ = resect_camera(mb, x, i, raw_b[i], seed=seed)
+        if b_ >= a + min_gain:
+            mb.c2w[i] = M
+            if inst_b is not None and len(inst_b[i]):
+                poses, s_ = mb.poses(x)
+                r = cv2.dilate(mb.render_one(mb.world(poses, s_), M, s_).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+                ok = [m.sum() > 0 and (m & r).sum() >= 0.4 * m.sum() for m in inst_b[i]]
+                u = np.zeros_like(raw_b[i])
+                for m, o in zip(inst_b[i], ok):
+                    if o or not any(ok):
+                        u |= m
+                mb.masks[i] = u
+            else:
+                mb.masks[i] = raw_b[i]
+            resected.append({"view": int(np.flatnonzero(have)[i]), "iou_raw_masks": [round(float(a), 3), round(float(b_), 3)]})
+    mb.area = mb.masks.reshape(len(mb.masks), -1).sum(1)
+    log(f"mask fit: cameras placed again from the silhouettes: {resected}")
+    info["cameras_resected"] = resected
+    if resected:
+        x = _polish(mb, bnds, x[None], log, n=1, tag=" (re-placed cameras)")
+
+    # 3b. the views still fitted badly: their cameras refined against their own masks
     iou = mb.iou(x)
     refined = []
     for i in np.flatnonzero(iou < refine_below):
@@ -320,6 +425,43 @@ def fit_masks(masks, c2w, K, can, n_lying, cams_up, log=print, long_side=320, se
     log(f"mask fit: cameras refined against their masks: {refined}")
     if refined:
         x = _polish(mb, bnds, x[None], log, n=1, tag=" (refined cameras)")
+    # 4. cans the detector missed: where a fitted can shows in a view but no mask covers it,
+    # SAM is asked for the can in that can's box; kept if it lies inside the fitted can
+    redetected = 0
+    if redetect is not None:
+        H0, W0 = np.asarray(masks[0]).shape
+        hb, wb = mb.masks.shape[1:]
+        fx, fy = W0 / wb, H0 / hb
+        poses, s_ = mb.poses(x)
+        world = mb.world(poses, s_)
+        for i in range(len(mb.c2w)):
+            each = mb.render_one(world, mb.c2w[i], s_, each=True)
+            boxes, which = [], []
+            for k, rk in enumerate(each):
+                a = rk.sum()
+                if a < 50 or (rk & mb.masks[i]).sum() >= 0.5 * a:
+                    continue
+                ys, xs = np.nonzero(rk)
+                boxes.append([xs.min() * fx, ys.min() * fy, (xs.max() + 1) * fx, (ys.max() + 1) * fy])
+                which.append(k)
+            if not boxes:
+                continue
+            try:
+                got = redetect(int(np.flatnonzero(have)[i]), np.array(boxes))
+            except Exception as e:  # noqa: BLE001
+                log(f"mask fit: re-detection failed in view {i} ({e!r})")
+                continue
+            for m, k in zip(got, which):
+                m = cv2.resize(m.astype(np.float32), (wb, hb), interpolation=cv2.INTER_AREA) >= 0.5
+                rk = each[k]
+                if m.sum() >= 0.3 * rk.sum() and (m & rk).sum() >= 0.6 * m.sum():
+                    mb.masks[i] |= m
+                    redetected += 1
+        mb.area = mb.masks.reshape(len(mb.masks), -1).sum(1)
+        log(f"mask fit: {redetected} cans the detector missed found again by SAM at the fitted cans' boxes")
+        if redetected:
+            x = _polish(mb, bnds, x[None], log, n=1, tag=" (re-detected cans)")
+    info["cans_redetected"] = redetected
     iou = mb.iou(x)
     b0, R0, s = mb.start(x)
     tilt = math.degrees(math.acos(min(1.0, float(R0[:, 2] @ ms.up0))))
