@@ -11,10 +11,16 @@ The camera is still (hand-held) and a hand turns the can on the table. Per frame
      shift in angle (matches that do not move are reflections, fixed to the view, and are
      dropped); all frame angles by weighted least squares, as the can turns in bursts and
      blurred frames match poorly,
-  4. the turn is closed (a late frame is matched against the first, the angles rescaled to
-     a whole turn), and every texel of the label atlas takes a low percentile of the frames that
-     saw it near face-on: the label plus the darkest reflection, as the pipeline's own label
-     estimate (sodacan.separate.label_median) is, but over the full 360 deg.
+  4. the turn is closed: a late frame is matched against the first and tied to --turns
+     whole turns. Frames where nothing matched (the can turned fast and blurred) are not
+     assumed still: the solve prefers a steady turning speed there, so the turn missing from
+     the matches goes into those gaps rather than being spread over the whole video (which
+     smeared the logo twice over),
+  5. every frame is then re-aligned against the mosaic of all the others (correlation of the
+     print, a few columns either way), twice, and every texel of the label atlas takes a low
+     percentile of the frames that saw it near face-on: the label plus the darkest reflection,
+     as the pipeline's own label estimate (sodacan.separate.label_median) is, but over the
+     full 360 deg.
 Writes into --out: label_atlas.npy (3, rows, cols) linear RGB in the pipeline's atlas layout
 (row 0 = the top of the can, column 0 = angle -pi), label_atlas.png (sRGB), and
 00_track.png / 01_strips.png / 02_rotation.png for checking.
@@ -133,6 +139,9 @@ def main():
     ap.add_argument("--theta-max", type=float, default=50.0, help="unwrap +- this many degrees around the front")
     ap.add_argument("--atlas", type=int, nargs=2, default=[192, 512], help="rows (height) cols (angle)")
     ap.add_argument("--percentile", type=float, default=25.0)
+    ap.add_argument("--turns", type=int, default=1, help="whole turns the can makes between the first frame and the closing one")
+    ap.add_argument("--smooth", type=float, default=0.3, help="weight of the steady-speed prior (per frame, in columns)")
+    ap.add_argument("--refine-iters", type=int, default=2, help="passes re-aligning every frame against the mosaic")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -185,42 +194,90 @@ def main():
     rhs = list(rhs_a[keep_eq])
     wts = list(np.array(wts)[keep_eq])
     n_dir = int(keep_eq.sum())
-    for i in range(n - 1):
-        rows_eq.append((i, i + 1)); rhs.append(0.0); wts.append(0.05)
-    A = np.zeros((len(rows_eq) + 1, n))
-    for k, (i, j) in enumerate(rows_eq):
-        A[k, i], A[k, j] = -wts[k], wts[k]
-    A[-1, 0] = 100.0  # phi_0 = 0
-    y = np.concatenate([np.array(rhs) * np.array(wts), [0.0]])
-    # robust: refit twice without the worst equations
-    keep = np.ones(len(y), bool)
-    for _ in range(3):
-        phi = np.linalg.lstsq(A[keep], y[keep], rcond=None)[0]
-        res = np.abs(A @ phi - y) / np.concatenate([np.array(wts), [100.0]])
-        keep = res < max(2.0, 3 * np.median(res[:len(rows_eq)]))
-        keep[-1] = True
-
-    # 4. close the turn: of the last quarter of the frames, the one matching the first frame best
+    # 4. the closing frame: of the last quarter of the frames, the one matching the first best
     turn = None
     for i in range(3 * n // 4, n):
-        s, m = sift_shift(mstrips[0], mstrips[i], sift, matcher, max_dy=3.0 * ms, min_shift=0.0)
-        if s is not None and (turn is None or m > turn[0]):
-            turn = (m, i, s / ms)
-    info = {"frames": n, "lid_match": [round(float(np.percentile(track[:, 2], 10)), 3), round(float(np.median(track[:, 2])), 3)],
-            "equations": int(keep.sum()), "equations_in_turn_direction": n_dir, "turn_before_closure_deg": round(float(phi[-1] * dth * 180 / math.pi), 1)}
+        sh, m = sift_shift(mstrips[0], mstrips[i], sift, matcher, max_dy=3.0 * ms, min_shift=0.0)
+        if sh is not None and (turn is None or m > turn[0]):
+            turn = (m, i, sh / ms)
+    eq = [(("d", i_, j_), r_, w_) for (i_, j_), r_, w_ in zip(rows_eq, rhs, wts)]
+    for i_ in range(1, n - 1):  # steady speed where nothing else says otherwise
+        eq.append((("dd", i_, 0), 0.0, args.smooth))
+    eq.append((("abs", 0, 0), 0.0, 100.0))  # phi_0 = 0
     if turn is not None:
-        m, i, s = turn
-        k = int(np.sign(phi[i])) * max(1, round(abs(phi[i] + s) / cols))
-        target = k * cols - s
-        scale = target / phi[i]
-        phi = phi * scale
-        info.update(closure_frame=int(i), closure_matches=int(m), turns=k, drift_correction=round(float(scale), 4))
+        m, ic, sh = turn
+        eq.append((("abs", ic, 0), sign * args.turns * cols + sh, 20.0))  # phi_i - phi_0 = sh + whole turns
+    A = np.zeros((len(eq), n))
+    y = np.zeros(len(eq))
+    for k_, ((kind, a_, b_), r_, w_) in enumerate(eq):
+        if kind == "d":
+            A[k_, a_], A[k_, b_] = -w_, w_
+        elif kind == "dd":
+            A[k_, a_ - 1], A[k_, a_], A[k_, a_ + 1] = w_, -2 * w_, w_
+        else:
+            A[k_, a_] = w_
+        y[k_] = r_ * w_
+    wv = np.array([e[2] for e in eq])
+    is_data = np.array([e[0][0] == "d" for e in eq])
+    keep = np.ones(len(y), bool)
+    for _ in range(3):  # robust: refit without the worst matches
+        phi = np.linalg.lstsq(A[keep], y[keep], rcond=None)[0]
+        res = np.abs(A @ phi - y) / wv
+        keep = ~is_data | (res < max(2.0, 3 * np.median(res[is_data]) if is_data.any() else 2.0))
+    info = {"frames": n, "lid_match": [round(float(np.percentile(track[:, 2], 10)), 3), round(float(np.median(track[:, 2])), 3)],
+            "equations": int(keep[is_data].sum()), "equations_in_turn_direction": n_dir,
+            "turn_deg": round(float(phi[-1] * dth * 180 / math.pi), 1)}
+    if turn is not None:
+        info.update(closure_frame=int(turn[1]), closure_matches=int(turn[0]), turns=args.turns,
+                    closure_residual_columns=round(float(phi[turn[1]] - (sign * args.turns * cols + turn[2])), 2))
 
-    # 5. composite: frame i column j shows the label at atlas column (j0 + j + phi_i)
+    # 5. every frame re-aligned against the mosaic of the others
     j0 = cols // 2 - len(thetas) // 2  # frame 0's front faces angle 0 (column cols/2)
+    face = np.cos(thetas) > math.cos(math.radians(args.theta_max - 5))
+    jf = np.nonzero(face)[0]
+    rlo = int(args.match_rows * rows)
+
+    def hp(g):
+        return g - cv2.blur(g, (9, 9))
+
+    gstrips = [hp(cv2.cvtColor(st, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255)[rlo:] for st in strips]
+    moves = []
+    for it in range(args.refine_iters):
+        acc = np.zeros((rows - rlo, cols), np.float32)
+        cnt = np.zeros(cols, np.float32)
+        for i_, g_ in enumerate(gstrips):
+            c_ = (np.round(j0 + jf + phi[i_]).astype(int)) % cols
+            np.add.at(acc.T, c_, g_[:, jf].T)
+            np.add.at(cnt, c_, 1)
+        mosaic = acc / np.maximum(cnt, 1)[None]
+        meas = np.zeros(n)
+        conf = np.zeros(n)
+        for i_, g_ in enumerate(gstrips):
+            best = (-2.0, 0)
+            for d in range(-12, 13):
+                c_ = (np.round(j0 + jf + phi[i_] + d).astype(int)) % cols
+                a_, b_ = g_[:, jf].ravel(), mosaic[:, c_].ravel()
+                cc = float(np.dot(a_ - a_.mean(), b_ - b_.mean()) / (np.linalg.norm(a_ - a_.mean()) * np.linalg.norm(b_ - b_.mean()) + 1e-9))
+                if cc > best[0]:
+                    best = (cc, d)
+            meas[i_], conf[i_] = phi[i_] + best[1], max(0.0, best[0])
+        # the re-aligned angles, smoothed by the same steady-speed prior
+        A2 = np.vstack([np.diag(conf * 10 + 1e-3)] + [np.zeros((0, n))])
+        rows_dd = []
+        for i_ in range(1, n - 1):
+            r_ = np.zeros(n)
+            r_[i_ - 1], r_[i_], r_[i_ + 1] = args.smooth, -2 * args.smooth, args.smooth
+            rows_dd.append(r_)
+        A2 = np.vstack([A2] + rows_dd)
+        y2 = np.concatenate([meas * (conf * 10 + 1e-3), np.zeros(len(rows_dd))])
+        new = np.linalg.lstsq(A2, y2, rcond=None)[0]
+        moves.append(round(float(np.median(np.abs(new - phi))), 2))
+        phi = new
+    info["refine_median_move_columns"] = moves
+
+    # 6. composite: frame i column j shows the label at atlas column (j0 + j + phi_i)
     stack = [[] for _ in range(cols)]
     lin = [srgb_to_linear(cv2.cvtColor(s, cv2.COLOR_BGR2RGB).astype(np.float32) / 255) for s in strips]
-    face = np.cos(thetas) > math.cos(math.radians(args.theta_max - 5))
     for i, S in enumerate(lin):
         for j in np.nonzero(face)[0]:
             c = int(round(j0 + j + phi[i])) % cols

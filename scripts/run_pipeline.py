@@ -134,6 +134,12 @@ def main():
     debug.save_rgb(out / "05_coverage.png", debug.heat(result.weight, result.valid))
     saved = {"pano": result.pano.cpu().numpy(), "weight": result.weight.cpu().numpy(), "valid": result.valid.cpu().numpy()}
     metrics = {"frames": int(len(frames)), "timing_s": timing}
+    if result.label is not None:
+        # the label as an atlas for other runs (run_noboard.py --label-atlas): with board poses
+        # the camera circles the can, so every side of the label is seen
+        saved["label"] = result.label.cpu().numpy()
+        saved["label_count"] = result.label_count.cpu().numpy()
+        np.save(out / "label_atlas.npy", saved["label"])
 
     if reference is not None:
         if not args.sim:

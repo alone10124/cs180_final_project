@@ -193,14 +193,28 @@ def _place_one(scene, coarse, fine, x, log, extent=0.2, step=0.012, yaws=15, kee
     return np.concatenate([x, best[1]]), best[0]
 
 
-def fit_cans(coarse, fine, can, b0, R0, s0, n_lying, log=print, max_tilt=0.12, max_shift=0.03):
+def fit_cans(coarse, fine, can, b0, R0, s0, n_lying, log=print, max_tilt=0.12, max_shift=0.03, lying0=None,
+             extra=None, extra_weight=1.0):
     """coarse, fine: can_fit.edge_data lists. (b0, R0, s0): a start for the upright can and
-    the scale (e.g. the SfM-point group fit snapped to the outlines). Returns
-    (cans [dict(kind, b, R)], s, info)."""
+    the scale (e.g. the SfM-point group fit snapped to the outlines). lying0: (n, 3) starts
+    (x, y, yaw) of the lying cans (else each is searched on a grid). extra(poses, s): a cost
+    added to the outline cost times extra_weight (e.g. 1 - silhouette IoU with can masks),
+    which keeps the refinement near a global start. Returns (cans [dict(kind, b, R)], s, info)."""
     scene = Scene(can, b0, R0, s0)
-    x = np.zeros(5)
+    if extra is not None:
+        base_cost = scene.cost
+
+        def cost(data, x, clip):
+            c = base_cost(data, x, clip)
+            if c >= 10.0:
+                return c
+            poses, s = scene.poses(x)
+            return c + extra_weight * extra(poses, s)
+
+        scene.cost = cost
+    x = np.zeros(5) if lying0 is None else np.concatenate([np.zeros(5), np.asarray(lying0, float).ravel()])
     info = {"cost_start": round(scene.cost(fine, x, 0.08), 4)}
-    for k in range(n_lying):
+    for k in range(n_lying if lying0 is None else 0):
         log(f"outline fit: lying can {k + 1}")
         res = _place_one(scene, coarse, fine, x, log)
         if res is None:
@@ -209,12 +223,18 @@ def fit_cans(coarse, fine, can, b0, R0, s0, n_lying, log=print, max_tilt=0.12, m
         x = res[0]
     info["cost_placed"] = round(scene.cost(fine, x, 0.08), 4)
     # everything together
+    for i in range(5, len(x), 3):
+        x[i + 2] = x[i + 2] % math.pi  # heading: a lying can looks the same turned by 180 deg
     lim = [(-max_shift, max_shift)] * 2 + [(-max_tilt, max_tilt)] * 2 + [(-0.25, 0.25)]
     for i in range(5, len(x), 3):
         lim += [(x[i] - 0.03, x[i] + 0.03), (x[i + 1] - 0.03, x[i + 1] + 0.03), (x[i + 2] - 0.3, x[i + 2] + 0.3)]
+    x = np.clip(x, [l for l, _ in lim], [h for _, h in lim])
     for clip in (0.12, 0.08, 0.05):
-        x = minimize(lambda q: scene.cost(fine, q, clip), np.clip(x, [l for l, _ in lim], [h for _, h in lim]),
-                     method="Powell", bounds=lim, options={"xtol": 1e-4, "ftol": 1e-6, "maxfev": 3000}).x
+        x0 = x
+        x = minimize(lambda q: scene.cost(fine, q, clip), x, method="Powell", bounds=lim,
+                     options={"xtol": 1e-4, "ftol": 1e-6, "maxfev": 3000}).x
+        if scene.cost(fine, x, clip) > scene.cost(fine, x0, clip):  # never end worse (e.g. on overlapping cans)
+            x = x0
     poses, s = scene.poses(x)
     info.update(cost_final=round(scene.cost(fine, x, 0.08), 4), scale_change=round(math.exp(x[4]), 4),
                 upright_moved_m=round(math.hypot(x[0], x[1]), 4), axis_tilted_deg=round(math.degrees(math.hypot(x[2], x[3])), 2),

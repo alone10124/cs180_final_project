@@ -26,6 +26,7 @@ import argparse
 import glob
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,7 +41,9 @@ sys.path.insert(0, str(ROOT))
 
 from sodacan import debug  # noqa: E402
 from sodacan.capture import can_fit  # noqa: E402
+from sodacan.capture.can_masks import detect_can_masks  # noqa: E402
 from sodacan.capture.group_fit import fit_group  # noqa: E402
+from sodacan.capture.mask_fit import fit_masks, mask_cost  # noqa: E402
 from sodacan.capture.multi_can_fit import fit_cans  # noqa: E402
 from sodacan.capture.pose_sfm import can_in_view, sfm_poses  # noqa: E402
 from sodacan.color import auto_exposure, linearize  # noqa: E402
@@ -132,6 +135,11 @@ def main():
                     help="keep pixels where a can mirrors another can (default: left out of label and room)")
     ap.add_argument("--fit-group", choices=["auto", "on", "off"], default="auto",
                     help="fit all cans together to the SfM points, reflection-aware (auto: when --lying > 0)")
+    ap.add_argument("--mask-fit", choices=["auto", "on", "off"], default="auto",
+                    help="pose all cans by their silhouettes (OWLv2 + SAM masks, multi-view) before the edge fit "
+                         "(auto: when --lying > 0)")
+    ap.add_argument("--label-flip-margin", type=float, default=0.05,
+                    help="with --label-atlas: turn a lying can end over end if its label then matches the video label better by this")
     ap.add_argument("--no-snap", action="store_true", help="keep the SfM-point fit as is (no outline check of scale and centre)")
     ap.add_argument("--reference", default=None, help="room panorama to compare with (default: <photos>/Ground Truth/*.jpg)")
     args = ap.parse_args()
@@ -173,11 +181,63 @@ def main():
     fine = can_fit.edge_data(rgb, c2w_sfm, K, count=args.fit_views)
     cams_up = can_fit._cam_up(c2w_sfm)
     group = args.fit_group == "on" or (args.fit_group == "auto" and args.lying > 0)
-    gf = fit_group(points, c2w_sfm, can, args.lying, log=log) if group and args.fit in ("points", "auto") else None
+    mf = None
+    if args.mask_fit == "on" or (args.mask_fit == "auto" and args.lying > 0):
+        det = detect_can_masks(rgb, device=device, log=log)
+        if det is not None:
+            masks = det[0]
+            views = []
+            for j in np.linspace(0, len(rgb) - 1, min(9, len(rgb))).astype(int):
+                img = rgb[j].copy()
+                img[masks[j]] = (0.5 * img[masks[j]] + [0, 127, 0]).astype(np.uint8)
+                for x0, y0, x1, y1 in det[1][j]:
+                    cv2.rectangle(img, (int(x0), int(y0)), (int(x1), int(y1)), (255, 255, 0), 3)
+                views.append(img)
+            debug.save_rgb(out / "01_masks.png", debug.montage(views, cols=3))
+            sm = [cv2.resize(m.astype(np.float32), (round(ww * 400 / max(ww, hh)), round(hh * 400 / max(ww, hh))),
+                             interpolation=cv2.INTER_AREA) >= 0.5 for m in masks]
+            np.savez_compressed(out / "masks.npz", masks=np.stack(sm))  # 400 px, for checking fits offline
+            mf = fit_masks(masks, c2w_sfm, K, can, args.lying, cams_up, log=log, workers=-1 if (os.cpu_count() or 1) > 1 else 1,
+                           instances=det[2])
+            if mf is not None:
+                # the masks kept (explained by the fitted scene) and the cameras refined against them
+                msc = mf["scene"]
+                views = []
+                vi = list(mf["views"])
+                for j in np.linspace(0, len(rgb) - 1, min(9, len(rgb))).astype(int):
+                    img = rgb[j].copy()
+                    if j in vi:
+                        mk = cv2.resize(msc.masks[vi.index(j)].astype(np.uint8), (ww, hh), interpolation=cv2.INTER_NEAREST).astype(bool)
+                        img[mk] = (0.5 * img[mk] + [0, 127, 0]).astype(np.uint8)
+                        dropped = masks[j] & ~mk
+                        img[dropped] = (0.5 * img[dropped] + [127, 0, 0]).astype(np.uint8)
+                    views.append(img)
+                debug.save_rgb(out / "01_masks_kept.png", debug.montage(views, cols=3))
+                if mf["info"].get("cameras_refined"):
+                    c2w_sfm = [np.asarray(M) for M in mf["c2w"]]
+                    fine = can_fit.edge_data(rgb, c2w_sfm, K, count=args.fit_views)
+    gf = None
+    if mf is None and group and args.fit in ("points", "auto"):
+        gf = fit_group(points, c2w_sfm, can, args.lying, log=log)
     pf = None
-    if gf is None and args.fit in ("points", "auto"):
+    if mf is None and gf is None and args.fit in ("points", "auto"):
         pf = can_fit.upright_from_points(points, c2w_sfm, can, log=log)
-    if gf is not None:
+    if mf is not None:
+        # silhouettes give the global pose (up, scale, every can); the edges then pin the rims
+        # and limbs, with the silhouette term kept so the refinement stays in that basin
+        sdata = can_fit.edge_data(rgb, c2w_sfm, K, count=10, long_side=1000)
+        msc = mf["scene"]
+        fit_cans_list, s, ofit = fit_cans(None, sdata, can, mf["b0"], mf["R0"], mf["s"], len(mf["lying"]), log=log,
+                                          lying0=mf["lying"], extra=lambda poses, sc: mask_cost(msc, poses, sc),
+                                          max_tilt=0.08, max_shift=0.02)
+        b0, R0 = fit_cans_list[0]["b"], fit_cans_list[0]["R"]
+        cans = [{"kind": c["kind"], "b": c["b"], "R": c["R"], "cost": can_fit.fit_cost(fine, can, c["b"], c["R"], s, clip=0.05)}
+                for c in fit_cans_list]
+        ofit["mask_iou_after"] = round(1 - mask_cost(msc, [(c["b"], c["R"]) for c in cans], s), 4)
+        metrics["fit"] = "silhouettes of all cans (OWLv2 + SAM masks, global search), then edges + silhouettes"
+        metrics["mask_fit"] = {"silhouettes": mf["info"], "edges_and_silhouettes": ofit}
+        pf = {"plane": np.zeros((0, 3)), "inliers": np.zeros((0, 3))}
+    elif gf is not None:
         # SfM points on chrome are reflections at the wrong depth, so they only start the fit:
         # the up direction and where the upright can stands. Its size and centre come from the
         # outlines (snap), then every can is fitted to the image edges together
@@ -315,9 +375,30 @@ def main():
         r = reconstruct(frames, cw, K, can, cfg, pixel_mask=pm)
         label, est = r.label, r.label
         if video_label is not None and r.label is not None:
-            # the label from the video, turned and scaled to this scene's own estimate
             z_rows = (round((1 - can.usable_z[1] / can.height) * r.label.shape[1]),
                       round((1 - can.usable_z[0] / can.height) * r.label.shape[1]))
+        if video_label is not None and r.label is not None and c["kind"] == "lying":
+            # a lying can's silhouette and outline barely say which end is the lid: its label
+            # does. Turned end over end, the can's label estimate is the same one flipped
+            # upside down (and mirrored, which fit_label_atlas tries anyway).
+            _, i1 = fit_label_atlas(video_label, r.label, r.label_count, rows=z_rows)
+            _, i2 = fit_label_atlas(video_label, r.label.flip(1), r.label_count.flip(0), rows=z_rows)
+            c1, c2 = i1.get("correlation", -1.0), i2.get("correlation", -1.0)
+            flip = c2 > c1 + args.label_flip_margin
+            metrics["cans"][k]["end_over_end"] = {"label_corr_as_fitted": round(c1, 3), "label_corr_turned": round(c2, 3),
+                                                  "turned": bool(flip)}
+            log(f"can {k}: label correlation as fitted {c1:.3f}, turned end over end {c2:.3f}"
+                + (" -> turned" if flip else ""))
+            if flip:
+                c["b"] = c["b"] + s * can.height * c["R"][:, 2]
+                c["R"] = c["R"] @ np.diag([1.0, -1.0, -1.0])
+                c["c2w"] = np.stack([can_fit.camera_in_can(M, c["b"], c["R"], s) for M in c2w_sfm])
+                cw = torch.tensor(c["c2w"], dtype=torch.float32, device=device)
+                c2w_cans[k] = cw
+                r = reconstruct(frames, cw, K, can, cfg, pixel_mask=pm)
+                label, est = r.label, r.label
+        if video_label is not None and r.label is not None:
+            # the label from the video, turned and scaled to this scene's own estimate
             fitted, linfo = fit_label_atlas(video_label, r.label, r.label_count, rows=z_rows)
             metrics["cans"][k]["video_label"] = linfo
             log(f"can {k}: video label {linfo}")
@@ -337,6 +418,9 @@ def main():
         cov = coverage_stats(results[-1][2])
         metrics["cans"][k]["coverage"] = cov
         log(f"can {k} ({c['kind']}): coverage {cov}, {hidden:.1%} of pixels hidden by another can")
+
+    np.savez_compressed(out / "cans_final.npz", cans_b=np.stack([c["b"] for c in cans]),
+                        cans_R=np.stack([c["R"] for c in cans]), scale=s, kinds=np.array([c["kind"] for c in cans]))
 
     def merge(rs):
         num = sum(p * wt[None] for p, wt, _ in rs)
